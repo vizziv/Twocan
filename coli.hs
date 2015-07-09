@@ -70,16 +70,16 @@ type Tenv = M.Map TypVar Typ
 infer :: Eenv -> Exp -> State ([TypVar], Tenv) Typ
 infer eenv exp =
     case exp of
-      EPrim _ -> return TPrim
-      EVar evar -> return (eenv ! evar)
+      EPrim _ -> pure TPrim
+      EVar evar -> pure (eenv ! evar)
       EOp op expL expR -> do
         infer eenv expL >>= unify TPrim
         infer eenv expR >>= unify TPrim
-        return TPrim
+        pure TPrim
       EFun evar exp -> do
         typX <- freshTyp
         typF <- infer (M.insert evar typX eenv) exp
-        TFun <$> subst typX <*> return typF
+        TFun <$> subst typX <*> pure typF
       EApp expF expX -> do
         typF <- infer eenv expF
         eenvF <- traverse subst eenv
@@ -87,7 +87,7 @@ infer eenv exp =
         typFSubst <- subst typF
         case typFSubst of
           TFun typXSubst typY | noFreeTvars typFSubst ->
-              unify typX typXSubst >> subst typY
+              unify typX typXSubst *> subst typY
           _ -> do
             typY <- freshTyp
             subst typF >>= unify (TFun typX typY)
@@ -95,23 +95,23 @@ infer eenv exp =
 
 unify typ1 typ2 =
     case (typ1, typ2) of
-      (TPrim, TPrim) -> return ()
+      (TPrim, TPrim) -> pure ()
       (TVar tvar, typ) -> setTvar tvar typ
       (typ, TVar tvar) -> setTvar tvar typ
       (TFun typX1 typY1, TFun typX2 typY2) ->
-          unify typX1 typX2 >> unify typY1 typY2
-      _ -> error ("have: " ++ show typ1 ++ ", need: " ++ show typ2 ++ ".")
+          unify typX1 typX2 *> unify typY1 typY2
+      _ -> error $ "have: " ++ show typ1 ++ ", need: " ++ show typ2 ++ "."
 
 subst typ =
     case typ of
       TVar tvar -> fromMaybe typ . M.lookup tvar <$> getTenv
       TFun typX typY -> TFun <$> subst typX <*> subst typY
-      _ -> return typ
+      _ -> pure typ
 
 setTvar tvar typ =
     if tvar `isFreeTvarIn` typ
-    then error ("infinite: " ++ show (TVar tvar) ++ " = " ++ show typ ++ ".")
-    else modifyTenv (M.insert tvar typ) >> substTenv
+    then error $ "infinite: " ++ show (TVar tvar) ++ " = " ++ show typ ++ "."
+    else modifyTenv (M.insert tvar typ) *> substTenv
 
 substTenv = do
   tenv <- getTenv
@@ -133,7 +133,7 @@ noFreeTvars typ =
 freshTyp = do
   (tvar : tvars, _) <- get
   modify (\(_, tenv) -> (tvars, tenv))
-  return $ TVar tvar
+  pure (TVar tvar)
 
 getTenv = snd <$> get
 
