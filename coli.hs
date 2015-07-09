@@ -7,7 +7,6 @@ import Control.Monad.Reader
 import Control.Monad.State
 import Data.List
 import Data.Maybe
-import Data.Map ((!))
 import Data.Traversable (traverse)
 import qualified Data.Map as M
 
@@ -44,15 +43,19 @@ type Env = M.Map ExpVar Val
 
 data Val =
     VPrim Prim
-  | VFun Env ExpVar Exp
+  | VFun ExpVar Exp Env
   deriving (Eq, Ord, Show)
 
-eval env exp = case exp of
-  EPrim prim -> VPrim prim
-  EVar var -> env ! var
-  EOp op expL expR -> evalOp op (eval env expL) (eval env expR)
-  EFun var exp -> VFun env var exp
-  EApp expF expX -> evalApp (eval env expF) (eval env expX)
+eval :: Exp -> Reader Env Val
+eval exp = case exp of
+  EPrim prim -> pure $ VPrim prim
+  EVar var -> envLookup var <$> getEnv
+  EOp op expL expR -> evalOp op <$> eval expL <*> eval expR
+  EFun var exp -> VFun var exp <$> getEnv
+  EApp expF expX -> do
+    valF <- eval expF
+    valX <- eval expX
+    evalApp valF valX
 
 evalOp op (VPrim primL) (VPrim primR) = VPrim (f primL primR)
     where
@@ -62,9 +65,13 @@ evalOp op (VPrim primL) (VPrim primR) = VPrim (f primL primR)
             Times -> (*)
             Over -> div
 
-evalApp (VFun env var exp) val = eval (M.insert var val env) exp
+evalApp (VFun var exp env) val = putVar env var val $ eval exp
 
-runEval = eval M.empty
+getEnv = ask
+
+putVar env var val = local $ M.insert var val . const env
+
+runEval = flip runReader M.empty . eval
 
 
 -- Type Inference
@@ -76,7 +83,7 @@ infer :: Exp -> StateT ([TypVar], Tenv) (Reader Eenv) Typ
 infer exp =
     case exp of
       EPrim _ -> pure TPrim
-      EVar evar -> (!) <$> getEenv <*> pure evar
+      EVar evar -> envLookup evar <$> getEenv
       EOp op expL expR -> do
         infer expL >>= unify TPrim
         substEenv $ do
@@ -159,4 +166,10 @@ freshTyp = do
 
 names = map (:[]) ['a'..'s'] ++ map (('t':) . show) [0..]
 
-runInfer = fst . flip runReader M.empty . flip runStateT (names, M.empty) . infer
+runInfer =
+    fst . flip runReader M.empty . flip runStateT (names, M.empty) . infer
+
+
+-- General
+
+envLookup var = fromMaybe (error $ "not found: " ++ var ++ ".") . M.lookup var
