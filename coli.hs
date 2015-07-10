@@ -109,7 +109,7 @@ infer = \case
     pure TPrim
   EFun evar exp -> do
     typX <- freshTyp
-    setEvar evar typX $ do
+    setEVar evar typX $ do
     typF <- infer exp
     TFun <$> subst typX <*> pure typF
   EApp expF expX -> do
@@ -118,7 +118,7 @@ infer = \case
     typX <- infer expX
     typFSubst <- subst typF
     case typFSubst of
-      TFun typXSubst typY | noFreeTvars typFSubst ->
+      TFun typXSubst typY | noFreeTVars typFSubst ->
         unify typX typXSubst *> subst typY
       _ -> do
         typY <- freshTyp
@@ -127,8 +127,8 @@ infer = \case
 
 unify = curry $ \case
   (TPrim, TPrim) -> pure ()
-  (TVar tvar, typ) -> setTvar tvar typ
-  (typ, TVar tvar) -> setTvar tvar typ
+  (TVar tvar, typ) -> setTVar tvar typ
+  (typ, TVar tvar) -> setTVar tvar typ
   (TFun typX1 typY1, TFun typX2 typY2) ->
     unify typX1 typX2 *> unify typY1 typY2
   (typ1, typ2) -> error $ "can't unify " ++ show typ1 ++ " with " ++ show typ2
@@ -138,10 +138,10 @@ subst = \case
   TFun typX typY -> TFun <$> subst typX <*> subst typY
   typ -> pure typ
 
-setEvar evar typ = local (M.insert evar typ)
+setEVar evar typ = local (M.insert evar typ)
 
-setTvar tvar typ =
-  if tvar `isFreeTvarIn` typ
+setTVar tvar typ =
+  if tvar `isFreeTVarIn` typ
   then error $ "infinite type " ++ show (TVar tvar) ++ " = " ++ show typ
   else modifyTEnv (M.insert tvar typ) *> substTEnv
 
@@ -163,14 +163,14 @@ modifyEEnv = local
 
 modifyTEnv f = modify (\(tvars, tenv) -> (tvars, f tenv))
 
-isFreeTvarIn tvar = \case
+isFreeTVarIn tvar = \case
   TVar tvarOther -> tvar == tvarOther
-  TFun typX typY -> tvar `isFreeTvarIn` typX || tvar `isFreeTvarIn` typY
+  TFun typX typY -> tvar `isFreeTVarIn` typX || tvar `isFreeTVarIn` typY
   _ -> False
 
-noFreeTvars = \case
+noFreeTVars = \case
   TVar _ -> False
-  TFun typX typY -> noFreeTvars typX && noFreeTvars typY
+  TFun typX typY -> noFreeTVars typX && noFreeTVars typY
   _ -> True
 
 freshTyp = do
