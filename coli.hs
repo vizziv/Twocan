@@ -1,3 +1,5 @@
+{-# LANGUAGE RecursiveDo #-}
+
 module Coli where
 
 import Prelude hiding (exp)
@@ -5,8 +7,7 @@ import Control.Applicative
 import Control.Monad
 import Control.Monad.Reader
 import Control.Monad.State
-import Data.List
-import Data.Maybe
+import Data.Maybe (fromMaybe)
 import Data.Traversable (traverse)
 import qualified Data.Map as M
 
@@ -14,17 +15,24 @@ import qualified Data.Map as M
 -- Expression Definition
 
 type Prim = Integer
-type ExpVar = String
-type TypVar = String
+type Nm = String
+type EVar = String
+type TVar = String
 
 data Op = Plus | Minus | Times | Over deriving (Eq, Ord, Show)
 
 data Exp =
     EPrim Prim
-  | EVar ExpVar
+  | EVar EVar
   | EOp Op Exp Exp
-  | EFun ExpVar Exp
+  | EFun EVar Exp
   | EApp Exp Exp
+  | ELet EVar Exp Exp
+  | EIfZero Exp Exp Exp
+  -- EInj Nm Exp
+  -- EDes Exp (M.Map Typ Exp)
+  -- ECon (M.Map Typ Exp)
+  -- EProj Nm Exp
   deriving (Eq, Ord, Show)
 
 
@@ -32,18 +40,23 @@ data Exp =
 
 data Typ =
     TPrim
-  | TVar TypVar
+  | TVar TVar
   | TFun Typ Typ
   deriving (Eq, Ord, Show)
 
 
+-- General
+
+envLookup var = fromMaybe (error $ "not found: " ++ var ++ ".") . M.lookup var
+
+
 -- Expression Evaluation
 
-type Env = M.Map ExpVar Val
+type Env = M.Map EVar Val
 
 data Val =
     VPrim Prim
-  | VFun ExpVar Exp Env
+  | VFun EVar Exp Env
   deriving (Eq, Ord, Show)
 
 eval :: Exp -> Reader Env Val
@@ -53,9 +66,15 @@ eval exp = case exp of
   EOp op expL expR -> evalOp op <$> eval expL <*> eval expR
   EFun var exp -> VFun var exp <$> getEnv
   EApp expF expX -> do
-    valF <- eval expF
+    (VFun var expY env) <- eval expF
     valX <- eval expX
-    evalApp valF valX
+    withEnv env . withVar var valX $ eval expY
+  ELet var expX expY -> mdo
+    (valX, valY) <- withVar var valX $ (,) <$> eval expX <*> eval expY
+    pure valY
+  EIfZero expI expT expE -> do
+    valI <- eval expI
+    eval $ if valI == VPrim 0 then expT else expE
 
 evalOp op (VPrim primL) (VPrim primR) = VPrim (f primL primR)
     where
@@ -65,28 +84,28 @@ evalOp op (VPrim primL) (VPrim primR) = VPrim (f primL primR)
             Times -> (*)
             Over -> div
 
-evalApp (VFun var exp env) val = putVar env var val $ eval exp
-
 getEnv = ask
 
-putVar env var val = local $ M.insert var val . const env
+withVar var val = local $ M.insert var val
+
+withEnv = local . const
 
 runEval = flip runReader M.empty . eval
 
 
 -- Type Inference
 
-type Eenv = M.Map ExpVar Typ
-type Tenv = M.Map TypVar Typ
+type EEnv = M.Map EVar Typ
+type TEnv = M.Map TVar Typ
 
-infer :: Exp -> StateT ([TypVar], Tenv) (Reader Eenv) Typ
+infer :: Exp -> StateT ([TVar], TEnv) (Reader EEnv) Typ
 infer exp =
     case exp of
       EPrim _ -> pure TPrim
-      EVar evar -> envLookup evar <$> getEenv
+      EVar evar -> envLookup evar <$> getEEnv
       EOp op expL expR -> do
         infer expL >>= unify TPrim
-        substEenv $ do
+        substEEnv $ do
         infer expR >>= unify TPrim
         pure TPrim
       EFun evar exp -> do
@@ -96,7 +115,7 @@ infer exp =
         TFun <$> subst typX <*> pure typF
       EApp expF expX -> do
         typF <- infer expF
-        substEenv $ do
+        substEEnv $ do
         typX <- infer expX
         typFSubst <- subst typF
         case typFSubst of
@@ -118,7 +137,7 @@ unify typ1 typ2 =
 
 subst typ =
     case typ of
-      TVar tvar -> fromMaybe typ . M.lookup tvar <$> getTenv
+      TVar tvar -> fromMaybe typ . M.lookup tvar <$> getTEnv
       TFun typX typY -> TFun <$> subst typX <*> subst typY
       _ -> pure typ
 
@@ -127,25 +146,25 @@ setEvar evar typ = local (M.insert evar typ)
 setTvar tvar typ =
     if tvar `isFreeTvarIn` typ
     then error $ "infinite: " ++ show (TVar tvar) ++ " = " ++ show typ ++ "."
-    else modifyTenv (M.insert tvar typ) *> substTenv
+    else modifyTEnv (M.insert tvar typ) *> substTEnv
 
-substEenv next = do
-  eenv <- getEenv
+substEEnv next = do
+  eenv <- getEEnv
   eenvSubst <- traverse subst eenv
-  modifyEenv (const eenvSubst) next
+  modifyEEnv (const eenvSubst) next
 
-substTenv = do
-  tenv <- getTenv
+substTEnv = do
+  tenv <- getTEnv
   tenvSubst <- traverse subst tenv
-  modifyTenv (const tenvSubst)
+  modifyTEnv (const tenvSubst)
 
-getEenv = ask
+getEEnv = ask
 
-getTenv = snd <$> get
+getTEnv = snd <$> get
 
-modifyEenv = local
+modifyEEnv = local
 
-modifyTenv f = modify (\(tvars, tenv) -> (tvars, f tenv))
+modifyTEnv f = modify (\(tvars, tenv) -> (tvars, f tenv))
 
 isFreeTvarIn tvar typ =
     case typ of
@@ -167,9 +186,7 @@ freshTyp = do
 names = map (:[]) ['a'..'s'] ++ map (('t':) . show) [0..]
 
 runInfer =
-    fst . flip runReader M.empty . flip runStateT (names, M.empty) . infer
-
-
--- General
-
-envLookup var = fromMaybe (error $ "not found: " ++ var ++ ".") . M.lookup var
+    fst
+    . flip runReader M.empty
+    . flip runStateT (names, M.empty)
+    . infer
