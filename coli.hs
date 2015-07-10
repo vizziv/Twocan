@@ -1,10 +1,10 @@
-{-# LANGUAGE LambdaCase, RecursiveDo #-}
+{-# LANGUAGE NoMonomorphismRestriction, LambdaCase, RecursiveDo #-}
 
 module Coli where
 
-import Prelude hiding (exp)
+import Prelude hiding (exp, (=<<))
 import Control.Applicative
-import Control.Monad
+import Control.Monad hiding ((=<<))
 import Control.Monad.Reader
 import Control.Monad.State
 import Data.Maybe (fromMaybe)
@@ -47,6 +47,13 @@ data Typ =
 
 -- General
 
+infixl 1 >>==
+(>>==) :: Monad m => m b -> (a -> b -> m c) -> a -> m c
+x >>== f = (x >>=) . f
+
+(.:) :: (c -> d) -> (a -> b -> c) -> a -> b -> d
+(.:) = fmap . fmap
+
 envLookup var = fromMaybe (error $ "no entry for " ++ var) . M.lookup var
 
 
@@ -86,7 +93,7 @@ evalOp op (VPrim primL) (VPrim primR) = VPrim (f primL primR)
 
 getEnv = ask
 
-withVar var val = local $ M.insert var val
+withVar = local .: M.insert
 
 withEnv = local . const
 
@@ -116,14 +123,22 @@ infer = \case
     typF <- infer expF
     substEEnv $ do
     typX <- infer expX
-    typFSubst <- subst typF
-    case typFSubst of
-      TFun typXSubst typY | noFreeTVars typFSubst ->
-        unify typX typXSubst *> subst typY
-      _ -> do
-        typY <- freshTyp
-        subst typF >>= unify (TFun typX typY)
-        subst typY
+    typY <- freshTyp
+    subst typF >>= unify (TFun typX typY)
+    subst typY
+  ELet evar expX expY -> mdo
+    typX <- freshTyp
+    setEVar evar typX $ do
+    infer expX >>= unify typX
+    substEEnv $ infer expY
+  EIfZero expI expT expE -> do
+    infer expI >>= unify TPrim
+    substEEnv $ do
+    typT <- infer expT
+    substEEnv $ do
+    typE <- infer expE
+    subst typT >>= unify typE
+    subst typE
 
 unify = curry $ \case
   (TPrim, TPrim) -> pure ()
