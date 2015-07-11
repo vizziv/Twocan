@@ -2,9 +2,9 @@
 
 module Coli where
 
-import Prelude hiding (exp, (=<<))
+import Prelude hiding (exp, lookup)
 import Control.Applicative
-import Control.Monad hiding ((=<<))
+import Control.Monad
 import Control.Monad.Reader
 import Control.Monad.State
 import Data.Maybe (fromMaybe)
@@ -28,11 +28,11 @@ data Exp =
   | EFun EVar Exp
   | EApp Exp Exp
   | ELet EVar Exp Exp
-  | EIfZero Exp Exp Exp
-  -- EInj Nm Exp
-  -- EDes Exp (M.Map Typ Exp)
-  -- ECon (M.Map Typ Exp)
-  -- EProj Nm Exp
+  | EBranch Exp Exp Exp
+  | ESum Nm Exp
+  | ECase Exp (M.Map Nm Exp)
+  | EProd (M.Map Nm Exp)
+  | EProj Nm Exp
   deriving (Eq, Ord, Show)
 
 
@@ -54,7 +54,7 @@ x >>== f = (x >>=) . f
 (.:) :: (c -> d) -> (a -> b -> c) -> a -> b -> d
 (.:) = fmap . fmap
 
-envLookup var = fromMaybe (error $ "no entry for " ++ var) . M.lookup var
+lookup key = fromMaybe (error $ "no entry for " ++ key) . M.lookup key
 
 
 -- Expression Evaluation
@@ -64,24 +64,37 @@ type Env = M.Map EVar Val
 data Val =
     VPrim Prim
   | VFun EVar Exp Env
+  | VSum Nm Val
+  | VProd (M.Map Nm Val)
   deriving (Eq, Ord, Show)
 
 eval :: Exp -> Reader Env Val
 eval = \case
   EPrim prim -> pure $ VPrim prim
-  EVar var -> envLookup var <$> getEnv
+  EVar var -> lookup var <$> getEnv
   EOp op expL expR -> evalOp op <$> eval expL <*> eval expR
   EFun var exp -> VFun var exp <$> getEnv
   EApp expF expX -> do
-    (VFun var expY env) <- eval expF
+    valF <- eval expF
     valX <- eval expX
-    withEnv env . withVar var valX $ eval expY
+    apply valF valX
   ELet var expX expY -> mdo
     (valX, valY) <- withVar var valX $ (,) <$> eval expX <*> eval expY
     pure valY
-  EIfZero expI expT expE -> do
+  EBranch expI expT expE -> do
     valI <- eval expI
-    eval $ if valI == VPrim 0 then expT else expE
+    eval $ if valI <= VPrim 0 then expT else expE
+  ESum nm exp -> VSum nm <$> eval exp
+  ECase exp exps -> do
+    (VSum nm valX) <- eval exp
+    valF <- eval $ lookup nm exps
+    apply valF valX
+  EProd exps -> VProd <$> traverse eval exps
+  EProj nm exp -> do
+    (VProd vals) <- eval exp
+    pure $ lookup nm vals
+
+apply (VFun var expY env) valX = withEnv env . withVar var valX $ eval expY
 
 evalOp op (VPrim primL) (VPrim primR) = VPrim (f primL primR)
     where
@@ -108,7 +121,7 @@ type TEnv = M.Map TVar Typ
 infer :: Exp -> StateT ([TVar], TEnv) (Reader EEnv) Typ
 infer = \case
   EPrim _ -> pure TPrim
-  EVar evar -> envLookup evar <$> getEEnv
+  EVar evar -> lookup evar <$> getEEnv
   EOp op expL expR -> do
     infer expL >>= unify TPrim
     substEEnv $ do
@@ -131,7 +144,7 @@ infer = \case
     setEVar evar typX $ do
     infer expX >>= unify typX
     substEEnv $ infer expY
-  EIfZero expI expT expE -> do
+  EBranch expI expT expE -> do
     infer expI >>= unify TPrim
     substEEnv $ do
     typT <- infer expT
