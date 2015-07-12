@@ -7,12 +7,13 @@ import Control.Applicative
 import Control.Monad
 import Control.Monad.Reader
 import Control.Monad.State
+import Data.Foldable (foldlM)
 import Data.Maybe (fromMaybe)
 import Data.Traversable (traverse)
 import qualified Data.Map as M
 
 
--- Expression Definition
+-- Language Definition
 
 type Prim = Integer
 type Nm = String
@@ -35,13 +36,21 @@ data Exp =
   | EProj Nm Exp
   deriving (Eq, Ord, Show)
 
-
--- Type Definition
-
 data Typ =
     TPrim
   | TVar TVar
   | TFun Typ Typ
+  | TSum (M.Map Nm Typ)
+  | TProd (M.Map Nm Typ)
+  deriving (Eq, Ord, Show)
+
+type Env = M.Map EVar Val
+
+data Val =
+    VPrim Prim
+  | VFun EVar Exp Env
+  | VSum Nm Val
+  | VProd (M.Map Nm Val)
   deriving (Eq, Ord, Show)
 
 
@@ -58,15 +67,6 @@ lookup key = fromMaybe (error $ "no entry for " ++ key) . M.lookup key
 
 
 -- Expression Evaluation
-
-type Env = M.Map EVar Val
-
-data Val =
-    VPrim Prim
-  | VFun EVar Exp Env
-  | VSum Nm Val
-  | VProd (M.Map Nm Val)
-  deriving (Eq, Ord, Show)
 
 eval :: Exp -> Reader Env Val
 eval = \case
@@ -118,78 +118,105 @@ runEval = flip runReader M.empty . eval
 type EEnv = M.Map EVar Typ
 type TEnv = M.Map TVar Typ
 
-infer :: Exp -> StateT ([TVar], TEnv) (Reader EEnv) Typ
+infer :: Exp -> State ([TVar], TEnv, EEnv) Typ
 infer = \case
   EPrim _ -> pure TPrim
   EVar evar -> lookup evar <$> getEEnv
   EOp op expL expR -> do
     infer expL >>= unify TPrim
-    substEEnv $ do
     infer expR >>= unify TPrim
     pure TPrim
   EFun evar exp -> do
     typX <- freshTyp
-    setEVar evar typX $ do
-    typF <- infer exp
-    TFun <$> subst typX <*> pure typF
+    withEVar evar typX $ do
+      typY <- infer exp
+      TFun <$> subst typX <*> pure typY
   EApp expF expX -> do
     typF <- infer expF
-    substEEnv $ do
     typX <- infer expX
     typY <- freshTyp
+    -- TODO: check for subtype.
     subst typF >>= unify (TFun typX typY)
     subst typY
   ELet evar expX expY -> mdo
     typX <- freshTyp
-    setEVar evar typX $ do
-    infer expX >>= unify typX
-    substEEnv $ infer expY
+    withEVar evar typX $ do
+      infer expX >>= unify typX
+      infer expY
   EBranch expI expT expE -> do
     infer expI >>= unify TPrim
-    substEEnv $ do
     typT <- infer expT
-    substEEnv $ do
     typE <- infer expE
     subst typT >>= unify typE
     subst typE
+  -- ESum nm exp -> TSum . M.singleton nm <$> infer exp
+  -- ECase expX expsF -> do
+  --   TSum typsX <- infer exp
+  --   typsF <- traverse infer expsF
+  --   M.foldM typsY
+  -- EProd exps -> TProd <$> traverse infer exps
+  -- EProj nm exp -> do
+  --   TProd typs <-
 
 unify = curry $ \case
-  (TPrim, TPrim) -> pure ()
+  (TPrim, TPrim) -> pure TPrim
   (TVar tvar, typ) -> setTVar tvar typ
   (typ, TVar tvar) -> setTVar tvar typ
   (TFun typX1 typY1, TFun typX2 typY2) ->
-    unify typX1 typX2 *> unify typY1 typY2
+    TFun <$> unify typX1 typX2 <*> unify typY1 typY2
+  -- (TSum typs1, TSum typs2) ->
+  --   TSum <$> traverse unify' (union typs1 typs2)
+  -- (TProd typs1, TProd typs2) ->
+  --   TProd <$> traverse unify' (intersect typs1 typs2)
   (typ1, typ2) -> error $ "can't unify " ++ show typ1 ++ " with " ++ show typ2
+
+data OneOrTwo a = One a | Two a a
+
+union m1 m2 = M.unionWith both (fmap One m1) (fmap One m2)
+    where both (One x) (One y) = Two x y
+
+intersect = M.intersectionWith Two
+
+unify' = \case
+  One typ -> pure typ
+  Two typ1 typ2 -> unify typ1 typ2
 
 subst = \case
   typ@(TVar tvar) -> fromMaybe typ . M.lookup tvar <$> getTEnv
   TFun typX typY -> TFun <$> subst typX <*> subst typY
   typ -> pure typ
 
-setEVar evar typ = local (M.insert evar typ)
+withEVar evar typ action = do
+  typqOld <- M.lookup evar <$> getEEnv
+  modifyEEnv $ M.insert evar typ
+  result <- action
+  case typqOld of
+    Nothing -> modifyEEnv (M.delete evar)
+    Just typOld -> modifyEEnv $ M.insert evar typOld
+  pure result
 
 setTVar tvar typ =
   if tvar `isFreeTVarIn` typ
   then error $ "infinite type " ++ show (TVar tvar) ++ " = " ++ show typ
-  else modifyTEnv (M.insert tvar typ) *> substTEnv
+  else modifyTEnv (M.insert tvar typ) *> substEnvs *> pure typ
 
-substEEnv next = do
+-- TODO: maybe use lenses to factor this nicely?
+
+substEnvs = do
   eenv <- getEEnv
   eenvSubst <- traverse subst eenv
-  modifyEEnv (const eenvSubst) next
-
-substTEnv = do
+  modifyEEnv (const eenvSubst)
   tenv <- getTEnv
   tenvSubst <- traverse subst tenv
   modifyTEnv (const tenvSubst)
 
-getEEnv = ask
+getEEnv = (\ (_, eenv, _) -> eenv) <$> get
 
-getTEnv = snd <$> get
+getTEnv = (\ (_, _, tenv) -> tenv) <$> get
 
-modifyEEnv = local
+modifyEEnv f = modify (\(tvars, eenv, tenv) -> (tvars, f eenv, tenv))
 
-modifyTEnv f = modify (\(tvars, tenv) -> (tvars, f tenv))
+modifyTEnv f = modify (\(tvars, eenv, tenv) -> (tvars, eenv, f tenv))
 
 isFreeTVarIn tvar = \case
   TVar tvarOther -> tvar == tvarOther
@@ -202,14 +229,10 @@ noFreeTVars = \case
   _ -> True
 
 freshTyp = do
-  (tvar : tvars, _) <- get
-  modify (\(_, tenv) -> (tvars, tenv))
+  (tvar : tvars, _, _) <- get
+  modify (\(_, eenv, tenv) -> (tvars, eenv, tenv))
   pure (TVar tvar)
 
 names = map (:[]) ['a'..'s'] ++ map (('t':) . show) [0..]
 
-runInfer =
-  fst
-  . flip runReader M.empty
-  . flip runStateT (names, M.empty)
-  . infer
+runInfer = fst . flip runState (names, M.empty, M.empty) . infer
