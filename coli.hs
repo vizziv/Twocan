@@ -12,7 +12,7 @@ import Data.Foldable
 import Data.Maybe (fromMaybe)
 import Data.Traversable
 import qualified Data.Map as M
-
+import Debug.Trace
 
 -- Language Definition
 
@@ -43,8 +43,8 @@ data Typ =
   | TFun Typ Typ
   | TSum (M.Map Nm Typ)
   | TProd (M.Map Nm Typ)
-  | TSub Typ
-  | TSuper Typ
+  | TSub TVar Typ
+  | TSuper TVar Typ
   deriving (Eq, Ord, Show)
 
 type Env = M.Map EVar Val
@@ -70,6 +70,7 @@ lookup key = fromMaybe (error $ "no entry for " ++ key) . M.lookup key
 
 unreachable = error "unreachable"
 
+debug on prefix x = if on then trace (prefix ++ ": " ++ show x) x else x
 
 -- Expression Evaluation
 
@@ -83,8 +84,8 @@ eval = \ case
     valF <- eval expF
     valX <- eval expX
     apply valF valX
-  ELet var expX expY -> mdo
-    (valX, valY) <- withVar var valX $ (,) <$> eval expX <*> eval expY
+  ELet var expX expY -> do
+    rec (valX, valY) <- withVar var valX $ (,) <$> eval expX <*> eval expY
     pure valY
   EBranch expI expT expE -> do
     valI <- eval expI
@@ -124,7 +125,7 @@ type EEnv = M.Map EVar Typ
 type TEnv = M.Map TVar Typ
 
 infer :: Exp -> State ([TVar], TEnv, EEnv) Typ
-infer = \ case
+infer = (. debug True "infer") $ \ case
   EPrim _ -> pure TPrim
   EVar evar -> lookup evar <$> getEEnv
   EOp op expL expR -> do
@@ -142,7 +143,7 @@ infer = \ case
     typY <- freshTyp
     subst typF >>= ensureSubOf (TFun typX typY)
     subst typY
-  ELet evar expX expY -> mdo
+  ELet evar expX expY -> do
     typX <- freshTyp
     withEVar evar typX $ do
       infer expX >>= ensureSubOf typX
@@ -164,6 +165,7 @@ infer = \ case
     subst typY
   exp -> error $ "can't infer " ++ show exp ++ " yet"
 
+-- TODO: add sub/super cases.
 commonSuper = curry $ \ case
   (TPrim, TPrim) -> pure TPrim
   (TVar tvar, typ) -> setTVar tvar typ
@@ -183,13 +185,15 @@ commonSuper = curry $ \ case
 
 ensureSubOf = flip ensureSub
 
+-- TODO: should this return the resulting subtype?
 ensureSub :: Typ -> Typ -> State ([TVar], TEnv, EEnv) ()
-ensureSub = curry $ substs >=> \ case
+ensureSub = curry . (. debug True "ensureSub") $ substs >=> \ case
   (TPrim, TPrim) -> pure ()
-  (TSub typ1, typ2) -> ensureSub typ1 typ2
-  (typ1, TSuper typ2) -> ensureSub typ1 typ2
-  (TVar tvar, typ) -> setTVar tvar (tsub typ) *> pure ()
-  (typ, TVar tvar) -> setTVar tvar (tsuper typ) *> pure ()
+  -- TODO: these two cases are (probably?) wrong!
+  (TSub _ typ1, typ2) -> ensureSub typ1 typ2
+  (typ1, TSuper _ typ2) -> ensureSub typ1 typ2
+  (TVar tvar, typ) -> setTVar tvar (mkTSub tvar typ) *> pure ()
+  (typ, TVar tvar) -> setTVar tvar (mkTSuper tvar typ) *> pure ()
   (TFun typX1 typY1, TFun typX2 typY2) ->
     ensureSub typX2 typX1 *> ensureSub typY1 typY2
   (TSum typs1, TSum typs2) ->
@@ -202,12 +206,14 @@ ensureSub = curry $ substs >=> \ case
     all id <$> traverse ensureSubProd (union typs1 typs2) >>= \ case
       False -> error $ "need " ++ show (TProd typs1) ++ " < " ++ show (TProd typs2)
       _ -> pure ()
-  (typ1, TSub typ2) -> case typ2 of
-    TSub _ -> ensureSub typ1 typ2
+  (typ1, TSub _ typ2) -> case typ2 of
+    -- TODO: make this first case unnecessary.
+    TSub _ _ -> ensureSub typ1 typ2
     TVar _ -> ensureSub typ1 typ2
     _ -> error $ "can't ensure " ++ show typ1 ++ " < " ++ show typ2
-  (TSuper typ1, typ2) -> case typ1 of
-    TSuper _ -> ensureSub typ1 typ2
+  (TSuper _ typ1, typ2) -> case typ1 of
+    -- TODO: make this first case unnecessary.
+    TSuper _ _ -> ensureSub typ1 typ2
     TVar _ -> ensureSub typ1 typ2
     _ -> error $ "can't ensure " ++ show typ1 ++ " < " ++ show typ2
   where
@@ -221,20 +227,6 @@ ensureSub = curry $ substs >=> \ case
       Snd _ -> pure False
       Both typ1 typ2 -> ensureSub typ1 typ2 *> pure True
 
-tsub = \ case
-  TPrim -> TPrim
-  TFun typX typY -> TFun (tsuper typX) (tsub typY)
-  TSub typ -> TSub typ
-  TSuper typ -> error "can we get away without supporting this?"
-  typ -> TSub typ
-
-tsuper = \ case
-  TPrim -> TPrim
-  TFun typX typY -> TFun (tsub typX) (tsuper typY)
-  TSuper typ -> TSuper typ
-  TSub typ -> error "can we get away without supporting this?"
-  typ -> TSuper typ
-
 data OneOrTwo a b = Fst a | Snd b | Both a b
 
 union m1 m2 = M.unionWith both (fmap Fst m1) (fmap Snd m2)
@@ -242,27 +234,46 @@ union m1 m2 = M.unionWith both (fmap Fst m1) (fmap Snd m2)
 
 intersect = M.intersectionWith Both
 
-traverseTVars f = \ case
+mkTSub tvar = \ case
+  TPrim -> TPrim
+  typ@(TVar tvarSub) -> if tvar == tvarSub then typ else TSub tvar typ
+  typ@(TSub _ _) -> typ
+  typ -> TSub tvar typ
+
+mkTSuper tvar = \ case
+  TPrim -> TPrim
+  typ@(TVar tvarOther) -> if tvar == tvarOther then typ else TSuper tvar typ
+  typ@(TSuper _ _) -> typ
+  typ -> TSuper tvar typ
+
+traverseTVars fTVar fTSub fTSuper = \ case
   TPrim -> pure TPrim
-  TVar tvar -> f tvar
+  TVar tvar -> fTVar tvar
   TFun typX typY -> TFun <$> t typX <*> t typY
   TSum typs -> TSum <$> traverse t typs
   TProd typs -> TProd <$> traverse t typs
-  -- Try to eliminate unnecessary TSub and TSuper constructors.
-  TSub typ -> tsub <$> t typ
-  TSuper typ -> tsuper <$> t typ
-  where t = traverseTVars f
+  TSub tvar typ -> t typ >>= fTSub tvar
+  TSuper tvar typ -> t typ >>= fTSuper tvar
+  where t = traverseTVars fTVar fTSub fTSuper
 
-subst = traverseTVars $ \ tvar ->
-        fromMaybe (TVar tvar) . M.lookup tvar <$> getTEnv
+subst = traverseTVars fTVar fTSub fTSuper
+  where
+    fTVar tvar = fromMaybe (TVar tvar) . M.lookup tvar <$> getTEnv
+    fTSub tvar typ = do
+      typq <- M.lookup tvar <$> getTEnv
+      case typq of
+        Nothing -> pure $ TSub tvar typ
+        Just typSub -> ensureSub typSub typ *> subst typSub
+    fTSuper = undefined
 
 withEVar evar typ action = do
   typqOld <- M.lookup evar <$> getEEnv
   modifyEEnv $ M.insert evar typ
   result <- action
+  modifyEEnv (M.delete evar)
   case typqOld of
-    Nothing -> modifyEEnv (M.delete evar)
-    Just typOld -> modifyEEnv $ M.insert evar typOld
+    Nothing -> pure ()
+    Just typOld -> subst typOld >>= modifyEEnv . M.insert evar
   pure result
 
 setTVar tvar typ =
@@ -286,17 +297,17 @@ modifyEEnv f = modify (\ (tvars, eenv, tenv) -> (tvars, f eenv, tenv))
 
 modifyTEnv f = modify (\ (tvars, eenv, tenv) -> (tvars, eenv, f tenv))
 
-foldMapTVars f = execWriter .: traverseTVars $ \ tvar ->
-                 tell (f tvar) *> pure unreachable
+foldMapTVars f = execWriter . traverseTVars g (const . g) (const . g)
+  where g tvar = tell (f tvar) *> pure unreachable
 
 isFreeTVarIn tvar = getAny . foldMapTVars (Any . (== tvar))
 
-noFreeTVars = getAll . foldMapTVars (All . const False)
-
-freshTyp = do
+freshTVar = do
   (tvar : tvars, _, _) <- get
   modify $ \ (_, eenv, tenv) -> (tvars, eenv, tenv)
-  pure (TVar tvar)
+  pure tvar
+
+freshTyp = TVar <$> freshTVar
 
 names = map (:[]) ['a'..'s'] ++ map (('t':) . show) [0..]
 
