@@ -32,6 +32,26 @@ exp_Fib =
     ELet "fib"
     (EFun "x"
      (ELet "n" (EProj "N" (EVar "x"))
+      (EBranch (EOp Minus (EVar "n") (EPrim 0))
+       (EProj "F0" (EVar "x"))
+       (EApp (EVar "fib")
+        (EProd $ M.fromList
+         [("N", EOp Minus (EVar "n") (EPrim 1)),
+          ("F0", (EProj "F1" (EVar "x"))),
+          ("F1", EOp Plus
+           (EProj "F0" (EVar "x"))
+           (EProj "F1" (EVar "x")))])))))
+    (EFun "n"
+     (EApp (EVar "fib")
+      (EProd $ M.fromList
+       [("N", EVar "n"),
+        ("F0", EPrim 0),
+        ("F1", EPrim 1)])))
+
+exp_FibWithCase =
+    ELet "fib"
+    (EFun "x"
+     (ELet "n" (EProj "N" (EVar "x"))
       (ECase (EApp (EApp exp_Le (EVar "n")) (EPrim 0)) $ M.fromList
        [("True", EFun "_" (EProj "F0" (EVar "x"))),
         ("False",
