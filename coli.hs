@@ -2,7 +2,7 @@
 
 module Coli where
 
-import Prelude hiding (exp, lookup)
+import Prelude hiding (exp, lookup, all)
 import Control.Applicative
 import Control.Monad
 import Control.Monad.Reader
@@ -128,8 +128,8 @@ infer = \ case
   EPrim _ -> pure TPrim
   EVar evar -> lookup evar <$> getEEnv
   EOp op expL expR -> do
-    infer expL >>= ensureSub TPrim
-    infer expR >>= ensureSub TPrim
+    infer expL >>= ensureSubOf TPrim
+    infer expR >>= ensureSubOf TPrim
     pure TPrim
   EFun evar exp -> do
     typX <- freshTyp
@@ -140,15 +140,15 @@ infer = \ case
     typF <- infer expF
     typX <- infer expX
     typY <- freshTyp
-    subst typF >>= ensureSub (TFun typX typY)
+    subst typF >>= ensureSubOf (TFun typX typY)
     subst typY
   ELet evar expX expY -> mdo
     typX <- freshTyp
     withEVar evar typX $ do
-      infer expX >>= ensureSub typX
+      infer expX >>= ensureSubOf typX
       infer expY
   EBranch expI expT expE -> do
-    infer expI >>= ensureSub TPrim
+    infer expI >>= ensureSubOf TPrim
     typT <- infer expT
     typE <- infer expE
     subst typT >>= commonSuper typE
@@ -158,9 +158,10 @@ infer = \ case
   --   typsF <- traverse infer expsF
   --   M.foldM typsY
   EProd exps -> TProd <$> traverse infer exps
-  -- EProj nm exp -> do
-  --   TProd typs <- infer exp
-  --   pure $ lookup nm typs
+  EProj nm expX -> do
+    typY <- freshTyp
+    infer expX >>= ensureSubOf (TProd $ M.fromList [(nm, typY)])
+    subst typY
   exp -> error $ "can't infer " ++ show exp ++ " yet"
 
 commonSuper = curry $ \ case
@@ -180,7 +181,10 @@ commonSuper = curry $ \ case
       Snd typ -> pure typ
       Both typ1 typ2 -> commonSuper typ1 typ2
 
-ensureSub = curry $ \ case
+ensureSubOf = flip ensureSub
+
+ensureSub :: Typ -> Typ -> State ([TVar], TEnv, EEnv) ()
+ensureSub = curry $ substs >=> \ case
   (TPrim, TPrim) -> pure ()
   (TSub typ1, typ2) -> ensureSub typ1 typ2
   (typ1, TSuper typ2) -> ensureSub typ1 typ2
@@ -189,20 +193,33 @@ ensureSub = curry $ \ case
   (TFun typX1 typY1, TFun typX2 typY2) ->
     ensureSub typX2 typX1 *> ensureSub typY1 typY2
   (TSum typs1, TSum typs2) ->
-    traverse_ ensureSubSum (union typs1 typs2)
+    -- traverse_ ensureSubSum (union typs1 typs2)
+    all id <$> traverse ensureSubSum (union typs1 typs2) >>= \ case
+      False -> error $ "need " ++ show (TSum typs1) ++ " < " ++ show (TSum typs2)
+      _ -> pure ()
   (TProd typs1, TProd typs2) ->
-    traverse_ ensureSubProd (union typs1 typs2)
-  (typ1, TSub typ2) -> error "can't ensure subtype"
-  (TSuper typ1, typ2) -> error "can't ensure supertype"
+    -- traverse_ ensureSubProd (union typs1 typs2)
+    all id <$> traverse ensureSubProd (union typs1 typs2) >>= \ case
+      False -> error $ "need " ++ show (TProd typs1) ++ " < " ++ show (TProd typs2)
+      _ -> pure ()
+  (typ1, TSub typ2) -> case typ2 of
+    TSub _ -> ensureSub typ1 typ2
+    TVar _ -> ensureSub typ1 typ2
+    _ -> error $ "can't ensure " ++ show typ1 ++ " < " ++ show typ2
+  (TSuper typ1, typ2) -> case typ1 of
+    TSuper _ -> ensureSub typ1 typ2
+    TVar _ -> ensureSub typ1 typ2
+    _ -> error $ "can't ensure " ++ show typ1 ++ " < " ++ show typ2
   where
+    substs (typ1, typ2) = (,) <$> subst typ1 <*> subst typ2
     ensureSubSum = \ case
-      Fst _ -> error "sum not subset"
-      Snd _ -> pure ()
-      Both typ1 typ2 -> ensureSub typ1 typ2
+      Fst _ -> pure False
+      Snd _ -> pure True
+      Both typ1 typ2 -> ensureSub typ1 typ2 *> pure True
     ensureSubProd = \ case
-      Fst _ -> pure ()
-      Snd _ -> error "product not superset"
-      Both typ1 typ2 -> ensureSub typ1 typ2
+      Fst _ -> pure True
+      Snd _ -> pure False
+      Both typ1 typ2 -> ensureSub typ1 typ2 *> pure True
 
 tsub = \ case
   TPrim -> TPrim
