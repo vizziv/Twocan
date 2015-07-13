@@ -14,6 +14,7 @@ import Data.Traversable
 import qualified Data.Map as M
 import Debug.Trace
 
+
 -- Language Definition
 
 type Prim = Integer
@@ -69,6 +70,7 @@ lookup key = fromMaybe (error $ "no entry for " ++ key) . M.lookup key
 unreachable = error "unreachable"
 
 debug on prefix x = if on then trace (prefix ++ ": " ++ show x) x else x
+
 
 -- Expression Evaluation
 
@@ -153,17 +155,15 @@ infer = (. debug True "infer") $ \ case
     subst typT >>= commonSuper typE
   ESum nm exp -> TSum . M.singleton nm <$> infer exp
   -- ECase expX expsF -> do
-  --   TSum typsX <- infer exp
   --   typsF <- traverse infer expsF
-  --   M.foldM typsY
+  --   typX <- infer exp
+  -- TODO: make new type variables, ensure things match up.
   EProd exps -> TProd <$> traverse infer exps
   EProj nm expX -> do
     typY <- freshTyp
     infer expX >>= ensureSubOf (TProd $ M.fromList [(nm, typY)])
     subst typY
-  exp -> error $ "can't infer " ++ show exp ++ " yet"
 
--- TODO: add sub/super cases.
 commonSuper = curry $ \ case
   (TPrim, TPrim) -> pure TPrim
   (TVar tvar, typ) -> setTVar tvar typ
