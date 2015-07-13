@@ -4,10 +4,11 @@ module Coli where
 
 import Prelude hiding (exp, lookup, all)
 import Control.Applicative
-import Control.Monad
-import Control.Monad.Reader
-import Control.Monad.State
-import Control.Monad.Writer
+import Control.Monad hiding (lub)
+import Control.Monad.Identity hiding (lub)
+import Control.Monad.Reader hiding (lub)
+import Control.Monad.State hiding (lub)
+import Control.Monad.Writer hiding (lub)
 import Data.Foldable
 import Data.Maybe (fromMaybe)
 import Data.Traversable
@@ -31,8 +32,10 @@ data Exp =
   | EFun EVar Exp
   | EApp Exp Exp
   | ELet EVar Exp Exp
+  -- Temporary branch if (<= 0) operator until we have real booleans.
   | EBranch Exp Exp Exp
   | ESum Nm Exp
+  -- Expressions in the map are functions handling each case.
   | ECase Exp (M.Map Nm Exp)
   | EProd (M.Map Nm Exp)
   | EProj Nm Exp
@@ -44,6 +47,12 @@ data Typ =
   | TFun Typ Typ
   | TSum (M.Map Nm Typ)
   | TProd (M.Map Nm Typ)
+  -- Only for type inference.
+  | TBot
+  | TTop
+  -- If we have two non-variable types, we can combine them.
+  | TGlb TVar Typ
+  | TLub TVar Typ
   deriving (Eq, Ord, Show)
 
 type Env = M.Map EVar Val
@@ -88,8 +97,8 @@ eval = \ case
     rec (valX, valY) <- withVar var valX $ (,) <$> eval expX <*> eval expY
     pure valY
   EBranch expI expT expE -> do
-    valI <- eval expI
-    eval $ if valI <= VPrim 0 then expT else expE
+    VPrim n <- eval expI
+    eval $ if n <= 0 then expT else expE
   ESum nm exp -> VSum nm <$> eval exp
   ECase exp exps -> do
     (VSum nm valX) <- eval exp
@@ -124,6 +133,7 @@ runEval = flip runReader M.empty . eval
 type EEnv = M.Map EVar Typ
 type TEnv = M.Map TVar Typ
 
+-- Order explicit throughout because subst and infer don't commute.
 infer :: Exp -> State ([TVar], TEnv, EEnv) Typ
 infer = (. debug True "infer") $ \ case
   EPrim _ -> pure TPrim
@@ -152,7 +162,7 @@ infer = (. debug True "infer") $ \ case
     infer expI >>= ensureSubOf TPrim
     typT <- infer expT
     typE <- infer expE
-    subst typT >>= commonSuper typE
+    lub typE <$> subst typT
   ESum nm exp -> TSum . M.singleton nm <$> infer exp
   -- ECase expX expsF -> do
   --   typsF <- traverse infer expsF
@@ -164,22 +174,23 @@ infer = (. debug True "infer") $ \ case
     infer expX >>= ensureSubOf (TProd $ M.fromList [(nm, typY)])
     subst typY
 
-commonSuper = curry $ \ case
-  (TPrim, TPrim) -> pure TPrim
-  (TVar tvar, typ) -> setTVar tvar typ
-  (typ, TVar tvar) -> setTVar tvar typ
+latticeOp conThis conDual = curry $ \ case
+  (TPrim, TPrim) -> TPrim
+  (TVar tvar, typ) -> conThis tvar typ
+  (typ, TVar tvar) -> conThis tvar typ
   (TFun typX1 typY1, TFun typX2 typY2) ->
-    TFun <$> commonSuper typX1 typX2 <*> commonSuper typY1 typY2
+    TFun (dual typX1 typX2) (this typY1 typY2)
   (TSum typs1, TSum typs2) ->
-    TSum <$> traverse commonSuper' (union typs1 typs2)
+    TSum $ fmap (onBoth this) (union typs1 typs2)
   (TProd typs1, TProd typs2) ->
-    TProd <$> traverse commonSuper' (intersect typs1 typs2)
+    TProd $ fmap (onBoth this) (intersect typs1 typs2)
   (typ1, typ2) -> error $ "can't unify " ++ show typ1 ++ " with " ++ show typ2
   where
-    commonSuper' = \ case
-      Fst typ -> pure typ
-      Snd typ -> pure typ
-      Both typ1 typ2 -> commonSuper typ1 typ2
+    this = latticeOp conThis conDual
+    dual = latticeOp conDual conThis
+
+lub = latticeOp TLub TGlb
+glb = latticeOp TGlb TLub
 
 ensureSubOf = flip ensureSub
 
@@ -212,7 +223,12 @@ ensureSub = curry . (. debug True "ensureSub") $ substs >=> \ case
       Snd _ -> pure False
       Both typ1 typ2 -> ensureSub typ1 typ2 *> pure True
 
-data OneOrTwo a b = Fst a | Snd b | Both a b
+data OneOrTwo a = Fst a | Snd a | Both a a
+
+onBoth f = \ case
+  Fst x -> x
+  Snd y -> y
+  Both x y -> f x y
 
 union m1 m2 = M.unionWith both (fmap Fst m1) (fmap Snd m2)
   where both (Fst x) (Snd y) = Both x y
