@@ -4,14 +4,15 @@ module Coli where
 
 import Prelude hiding (exp, lookup, all)
 import Control.Applicative
-import Control.Monad hiding (lub)
-import Control.Monad.Identity hiding (lub)
-import Control.Monad.Reader hiding (lub)
-import Control.Monad.State hiding (lub)
-import Control.Monad.Writer hiding (lub)
+import Control.Monad
+import Control.Monad.Identity
+import Control.Monad.Reader
+import Control.Monad.State
+import Control.Monad.Writer
 import Data.Foldable
 import Data.Maybe (fromMaybe)
 import Data.Traversable
+import Data.Tuple
 import qualified Data.Map as M
 import Debug.Trace
 
@@ -130,11 +131,13 @@ runEval = flip runReader M.empty . eval
 
 -- Type Inference
 
+data Bound = BExact Typ | BBetween Typ Typ deriving (Eq, Ord, Show)
+
 type EEnv = M.Map EVar Typ
-type TEnv = M.Map TVar Typ
+type TEnv = M.Map TVar Bound
 
 -- Order explicit throughout because subst and infer don't commute.
-infer :: Exp -> State ([TVar], TEnv, EEnv) Typ
+infer :: Exp -> State ([TVar], EEnv, TEnv) Typ
 infer = (. debug True "infer") $ \ case
   EPrim _ -> pure TPrim
   EVar evar -> lookup evar <$> getEEnv
@@ -174,43 +177,96 @@ infer = (. debug True "infer") $ \ case
     infer expX >>= ensureSubOf (TProd $ M.fromList [(nm, typY)])
     subst typY
 
-latticeOp conThis conDual = curry $ \ case
+lattice con bound setOp = curry $ \ case
+  (typ, _) | typ == this bound -> this bound
+  (_, typ) | typ == this bound -> this bound
+  (typ1, typ2) | typ1 == dual bound -> typ2
+  (typ1, typ2) | typ2 == dual bound -> typ1
   (TPrim, TPrim) -> TPrim
-  (TVar tvar, typ) -> conThis tvar typ
-  (typ, TVar tvar) -> conThis tvar typ
+  (TVar tvar, typ) -> this con tvar typ
+  (typ, TVar tvar) -> this con tvar typ
   (TFun typX1 typY1, TFun typX2 typY2) ->
-    TFun (dual typX1 typX2) (this typY1 typY2)
+    TFun (dual latticeOp typX1 typX2) (this latticeOp typY1 typY2)
   (TSum typs1, TSum typs2) ->
-    TSum $ fmap (onBoth this) (union typs1 typs2)
+    TSum $ fmap (onBoth $ this latticeOp) (this setOp typs1 typs2)
   (TProd typs1, TProd typs2) ->
-    TProd $ fmap (onBoth this) (intersect typs1 typs2)
+    TProd $ fmap (onBoth $ this latticeOp) (dual setOp typs1 typs2)
   (typ1, typ2) -> error $ "can't unify " ++ show typ1 ++ " with " ++ show typ2
   where
-    this = latticeOp conThis conDual
-    dual = latticeOp conDual conThis
+    latticeOp = (lattice con bound setOp,
+                 lattice (swap con) (swap bound) (swap setOp))
+    this = fst
+    dual = snd
 
-lub = latticeOp TLub TGlb
-glb = latticeOp TGlb TLub
+glb = lattice (TGlb, TLub) (TBot, TTop) (intersect, union)
+lub = lattice (TLub, TGlb) (TTop, TBot) (union, intersect)
+
+data Cmp = Eq | Lt | Gt | Nc deriving (Eq, Ord, Show)
+
+cmp typ1 typ2 | typ1 == typ2 = Eq
+              | typGlb == typ1 = Lt
+              | typGlb == typ2 = Gt
+              | otherwise = Nc
+  where typGlb = glb typ1 typ2
+
+le = (.: cmp) $ \ case
+  Gt -> False
+  _ -> True
+
+mergeBound = curry $ \ case
+  (BExact typ1, BExact typ2) ->
+    if typ1 == typ2
+    then BExact typ1
+    else error $ "need " ++ show typ1 ++ " = " ++ show typ2
+  (BExact typ1, BBetween typL2 typU2) ->
+    if typL2 `le` typ1 && typ1 `le` typU2
+    then BExact typ1
+    else error $ "need " ++ show typL2 ++ " < "
+           ++ show typ1 ++ " < " ++ show typU2
+  (bound1@(BBetween _ _), bound2@(BExact _)) -> mergeBound bound2 bound1
+  (BBetween typL1 typU1, BBetween typL2 typU2) ->
+    mkBound (lub typL1 typL2) (glb typU1 typU2)
+
+mkBound typL typU = case typL `cmp` typU of
+                      Lt -> if cantSuper typL then BExact typL
+                            else if cantSub typU then BExact typU
+                            else BBetween typL typU
+                      Eq -> BExact typL
+                      _ -> error $ "need " ++ show typL ++ " < " ++ show typU
+
+cantSub = \ case
+  TPrim -> True
+  TFun typX typY -> cantSuper typX && cantSub typY
+  TSum typs -> M.null typs
+  TBot -> True
+  _ -> False
+
+cantSuper = \ case
+  TPrim -> True
+  TFun typX typY -> cantSub typX && cantSuper typY
+  TProd typs -> M.null typs
+  TTop -> True
+  _ -> False
 
 ensureSubOf = flip ensureSub
 
 -- TODO: should this return the resulting subtype?
-ensureSub :: Typ -> Typ -> State ([TVar], TEnv, EEnv) ()
+ensureSub :: Typ -> Typ -> State ([TVar], EEnv, TEnv) ()
 ensureSub = curry . (. debug True "ensureSub") $ substs >=> \ case
   (TPrim, TPrim) -> pure ()
-  (TVar tvar, typ) -> setTVar tvar typ *> pure ()
-  (typ, TVar tvar) -> setTVar tvar typ *> pure ()
+  (TVar tvar, typ) -> boundTVar tvar $ mkBound TBot typ
+  (typ, TVar tvar) -> boundTVar tvar $ mkBound typ TTop
   (TFun typX1 typY1, TFun typX2 typY2) ->
     ensureSub typX2 typX1 *> ensureSub typY1 typY2
   (TSum typs1, TSum typs2) ->
     -- traverse_ ensureSubSum (union typs1 typs2)
     all id <$> traverse ensureSubSum (union typs1 typs2) >>= \ case
-      False -> error $ "need " ++ show (TSum typs1) ++ " < " ++ show (TSum typs2)
+      False -> error $ "don't have " ++ show (TSum typs1) ++ " < " ++ show (TSum typs2)
       _ -> pure ()
   (TProd typs1, TProd typs2) ->
     -- traverse_ ensureSubProd (union typs1 typs2)
     all id <$> traverse ensureSubProd (union typs1 typs2) >>= \ case
-      False -> error $ "need " ++ show (TProd typs1) ++ " < " ++ show (TProd typs2)
+      False -> error $ "don't have " ++ show (TProd typs1) ++ " < " ++ show (TProd typs2)
       _ -> pure ()
   where
     substs (typ1, typ2) = (,) <$> subst typ1 <*> subst typ2
@@ -235,16 +291,32 @@ union m1 m2 = M.unionWith both (fmap Fst m1) (fmap Snd m2)
 
 intersect = M.intersectionWith Both
 
-traverseTVars f = \ case
+traverseTVars fPrim fGlb fLub = \ case
   TPrim -> pure TPrim
-  TVar tvar -> f tvar
+  TVar tvar -> fPrim tvar
   TFun typX typY -> TFun <$> t typX <*> t typY
   TSum typs -> TSum <$> traverse t typs
   TProd typs -> TProd <$> traverse t typs
-  where t = traverseTVars f
+  TTop -> pure TTop
+  TBot -> pure TBot
+  TGlb tvar typ -> t typ >>= fGlb tvar
+  TLub tvar typ -> t typ >>= fLub tvar
+  where t = traverseTVars fPrim fGlb fLub
 
-subst = traverseTVars $ \ tvar ->
-        fromMaybe (TVar tvar) . M.lookup tvar <$> getTEnv
+subst = traverseTVars fPrim fGlb fLub
+  where
+    fPrim tvar = do
+      boundq <- M.lookup tvar <$> getTEnv
+      pure $ case boundq of
+               Just (BExact typ) -> typ
+               _ -> TVar tvar
+    -- TODO: these....
+    fGlb tvar = undefined
+    fLub tvar = undefined
+
+traverseBound f = \ case
+  BExact typ -> BExact <$> f typ
+  BBetween typL typU -> mkBound <$> f typL <*> f typU
 
 withEVar evar typ action = do
   typqOld <- M.lookup evar <$> getEEnv
@@ -256,31 +328,36 @@ withEVar evar typ action = do
     Just typOld -> subst typOld >>= modifyEEnv . M.insert evar
   pure result
 
-setTVar tvar typ =
-  if tvar `isFreeTVarIn` typ
-  then error $ "infinite type " ++ show (TVar tvar) ++ " = " ++ show typ
-  else modifyTEnv (M.insert tvar typ) *> substEnvs *> pure typ
+boundTVar tvar bound =
+  if tvar `isFreeTVarIn` bound
+  then error $ "infinite type " ++ show (TVar tvar) ++ " = " ++ show bound
+  else modifyTEnv (M.insertWith mergeBound tvar bound) *> substEnvs
 
 substEnvs = do
   eenv <- getEEnv
   eenvSubst <- traverse subst eenv
   modifyEEnv (const eenvSubst)
   tenv <- getTEnv
-  tenvSubst <- traverse subst tenv
+  tenvSubst <- traverse (traverseBound subst) tenv
   modifyTEnv (const tenvSubst)
 
 getEEnv = (\ (_, eenv, _) -> eenv) <$> get
 
 getTEnv = (\ (_, _, tenv) -> tenv) <$> get
 
-modifyEEnv f = modify (\ (tvars, eenv, tenv) -> (tvars, f eenv, tenv))
+modifyEEnv f = modify (\ (tvars, eenv, tenv) ->
+                       (tvars, debug True "eenv" $ f eenv, tenv))
 
-modifyTEnv f = modify (\ (tvars, eenv, tenv) -> (tvars, eenv, f tenv))
+modifyTEnv f = modify (\ (tvars, eenv, tenv) ->
+                       (tvars, eenv, debug True "tenv" $ f tenv))
 
-foldMapTVars f = execWriter .: traverseTVars $ \ tvar ->
-                 tell (f tvar) *> pure unreachable
+foldMapTVars f = execWriter . traverseTVars g (const . g) (const . g)
+  where g tvar = tell (f tvar) *> pure unreachable
 
-isFreeTVarIn tvar = getAny . foldMapTVars (Any . (== tvar))
+isFreeTVarIn tvar = \ case
+  BExact typ -> isFreeIn typ
+  BBetween typL typU -> isFreeIn typL || isFreeIn typU
+  where isFreeIn = getAny . foldMapTVars (Any . (== tvar))
 
 freshTVar = do
   (tvar : tvars, _, _) <- get
