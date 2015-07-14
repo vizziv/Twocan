@@ -66,11 +66,29 @@ data Val =
   deriving (Eq, Ord, Show)
 
 
--- General
+-- Conventions
 
-infixl 1 >>==
-(>>==) :: Monad m => m b -> (a -> b -> m c) -> a -> m c
-x >>== f = (x >>=) . f
+{-
+
+Abbreviations:
+  typ = TYPe
+  exp = EXPression
+
+Tags:
+  X = argument of a function (e.g. TFun typX typY)
+  Y = result of a function (e.g. EFun evar expY)
+  F = function itself
+
+In effectful code, use
+  pure and *> when (almost) completely applicative,
+  return and >> when monadic or when resulting in much nicer infix precedence.
+
+I've grown accustomed to SML's fn, thus the extensive \ case use....
+
+-}
+
+
+-- General
 
 (.:) :: (c -> d) -> (a -> b -> c) -> a -> b -> d
 (.:) = fmap . fmap
@@ -86,7 +104,7 @@ debug on prefix x = if on then trace (prefix ++ ": " ++ show x) x else x
 
 eval :: Exp -> Reader Env Val
 eval = \ case
-  EPrim prim -> pure $ VPrim prim
+  EPrim prim -> return $ VPrim prim
   EVar var -> lookup var <$> getEnv
   EOp op expL expR -> evalOp op <$> eval expL <*> eval expR
   EFun var exp -> VFun var exp <$> getEnv
@@ -96,7 +114,7 @@ eval = \ case
     apply valF valX
   ELet var expX expY -> do
     rec (valX, valY) <- withVar var valX $ (,) <$> eval expX <*> eval expY
-    pure valY
+    return valY
   EBranch expI expT expE -> do
     VPrim n <- eval expI
     eval $ if n <= 0 then expT else expE
@@ -108,7 +126,7 @@ eval = \ case
   EProd exps -> VProd <$> traverse eval exps
   EProj nm exp -> do
     (VProd vals) <- eval exp
-    pure $ lookup nm vals
+    return $ lookup nm vals
 
 apply (VFun var expY env) valX = withEnv env . withVar var valX $ eval expY
 
@@ -147,20 +165,15 @@ infer = (. debug True "infer") $ \ case
     pure TPrim
   EFun evar exp -> do
     typX <- freshTyp
-    withEVar evar typX $ do
-      typY <- infer exp
-      TFun <$> subst typX <*> pure typY
+    withEVar evar $ \ typX -> TFun typX <$> infer exp
   EApp expF expX -> do
     typF <- infer expF
     typX <- infer expX
     typY <- freshTyp
     subst typF >>= ensureSubOf (TFun typX typY)
     subst typY
-  ELet evar expX expY -> do
-    typX <- freshTyp
-    withEVar evar typX $ do
-      infer expX >>= ensureSubOf typX
-      infer expY
+  ELet evar expX expY ->
+    withEVar evar $ \ typX -> infer expX >>= ensureSubOf typX >> infer expY
   EBranch expI expT expE -> do
     infer expI >>= ensureSubOf TPrim
     typT <- infer expT
@@ -193,10 +206,10 @@ lattice con bound setOp = curry $ \ case
     TProd $ fmap (onBoth $ this latticeOp) (dual setOp typs1 typs2)
   (typ1, typ2) -> error $ "can't unify " ++ show typ1 ++ " with " ++ show typ2
   where
-    latticeOp = (lattice con bound setOp,
-                 lattice (swap con) (swap bound) (swap setOp))
     this = fst
     dual = snd
+    latticeOp = (lattice con bound setOp,
+                 lattice (swap con) (swap bound) (swap setOp))
 
 glb = lattice (TGlb, TLub) (TBot, TTop) (intersect, union)
 lub = lattice (TLub, TGlb) (TTop, TBot) (union, intersect)
@@ -291,37 +304,33 @@ union m1 m2 = M.unionWith both (fmap Fst m1) (fmap Snd m2)
 
 intersect = M.intersectionWith Both
 
-traverseTVars fPrim fGlb fLub = \ case
+traverseTVars f = \ case
   TPrim -> pure TPrim
-  TVar tvar -> fPrim tvar
+  TVar tvar -> f tvar
   TFun typX typY -> TFun <$> t typX <*> t typY
   TSum typs -> TSum <$> traverse t typs
   TProd typs -> TProd <$> traverse t typs
   TTop -> pure TTop
   TBot -> pure TBot
-  TGlb tvar typ -> t typ >>= fGlb tvar
-  TLub tvar typ -> t typ >>= fLub tvar
-  where t = traverseTVars fPrim fGlb fLub
+  TGlb tvar typ -> glb <$> f tvar <*> t typ
+  TLub tvar typ -> lub <$> f tvar <*> t typ
+  where t = traverseTVars f
 
-subst = traverseTVars fPrim fGlb fLub
-  where
-    fPrim tvar = do
-      boundq <- M.lookup tvar <$> getTEnv
-      pure $ case boundq of
-               Just (BExact typ) -> typ
-               _ -> TVar tvar
-    -- TODO: these....
-    fGlb tvar = undefined
-    fLub tvar = undefined
+subst = traverseTVars $ \ tvar -> do
+          boundq <- M.lookup tvar <$> getTEnv
+          pure $ case boundq of
+                   Just (BExact typ) -> typ
+                   _ -> TVar tvar
 
 traverseBound f = \ case
   BExact typ -> BExact <$> f typ
   BBetween typL typU -> mkBound <$> f typL <*> f typU
 
-withEVar evar typ action = do
+withEVar evar action = do
+  typNew <- freshTyp
   typqOld <- M.lookup evar <$> getEEnv
-  modifyEEnv $ M.insert evar typ
-  result <- action
+  modifyEEnv $ M.insert evar typNew
+  result <- action typNew
   modifyEEnv (M.delete evar)
   case typqOld of
     Nothing -> pure ()
@@ -345,27 +354,25 @@ getEEnv = (\ (_, eenv, _) -> eenv) <$> get
 
 getTEnv = (\ (_, _, tenv) -> tenv) <$> get
 
-modifyEEnv f = modify (\ (tvars, eenv, tenv) ->
-                       (tvars, debug True "eenv" $ f eenv, tenv))
+modifyEEnv f = modify $ \ (tvars, eenv, tenv) ->
+               (tvars, debug True "eenv" $ f eenv, tenv)
 
-modifyTEnv f = modify (\ (tvars, eenv, tenv) ->
-                       (tvars, eenv, debug True "tenv" $ f tenv))
+modifyTEnv f = modify $ \ (tvars, eenv, tenv) ->
+               (tvars, eenv, debug True "tenv" $ f tenv)
 
-foldMapTVars f = execWriter . traverseTVars g (const . g) (const . g)
-  where g tvar = tell (f tvar) *> pure unreachable
+foldMapTVars f =
+  execWriter .: traverseTVars $ \ tvar -> tell (f tvar) *> pure unreachable
 
 isFreeTVarIn tvar = \ case
   BExact typ -> isFreeIn typ
   BBetween typL typU -> isFreeIn typL || isFreeIn typU
   where isFreeIn = getAny . foldMapTVars (Any . (== tvar))
 
-freshTVar = do
+freshTyp = do
   (tvar : tvars, _, _) <- get
   modify $ \ (_, eenv, tenv) -> (tvars, eenv, tenv)
-  pure tvar
-
-freshTyp = TVar <$> freshTVar
+  pure $ TVar tvar
 
 names = map (:[]) ['a'..'s'] ++ map (('t':) . show) [0..]
 
-runInfer = flip evalState (names, M.empty, M.empty) . infer
+runInfer = flip evalState (names, M.empty, M.empty) . (subst <=< infer)
