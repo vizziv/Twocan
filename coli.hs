@@ -178,7 +178,10 @@ infer = (. debug True "infer") $ \ case
     infer expI >>= ensureSubOf TPrim
     typT <- infer expT
     typE <- infer expE
-    lub typE <$> subst typT
+    typ <- freshTyp
+    ensureSub typ typT
+    subst typ >>= ensureSuperOf typE
+    subst typ
   ESum nm exp -> TSum . M.singleton nm <$> infer exp
   -- ECase expX expsF -> do
   --   typsF <- traverse infer expsF
@@ -190,7 +193,7 @@ infer = (. debug True "infer") $ \ case
     infer expX >>= ensureSubOf (TProd $ M.fromList [(nm, typY)])
     subst typY
 
-lattice con bound setOp = curry $ \ case
+lattice con bound setOp simpl = curry $ \ case
   (typ, _) | typ == this bound -> this bound
   (_, typ) | typ == this bound -> this bound
   (typ1, typ2) | typ1 == dual bound -> typ2
@@ -204,15 +207,28 @@ lattice con bound setOp = curry $ \ case
     TSum $ fmap (onBoth $ this latticeOp) (this setOp typs1 typs2)
   (TProd typs1, TProd typs2) ->
     TProd $ fmap (onBoth $ this latticeOp) (dual setOp typs1 typs2)
-  (typ1, typ2) -> error $ "can't unify " ++ show typ1 ++ " with " ++ show typ2
+  (typ1, typ2) -> case this simpl typ1 typ2 of
+                    Just typ -> typ
+                    Nothing -> error $ "can't unify " ++ show typ1
+                                            ++ " with " ++ show typ2
   where
     this = fst
     dual = snd
-    latticeOp = (lattice con bound setOp,
-                 lattice (swap con) (swap bound) (swap setOp))
+    latticeOp = (lattice con bound setOp simpl,
+                 lattice (swap con) (swap bound) (swap setOp) (swap simpl))
 
-glb = lattice (TGlb, TLub) (TBot, TTop) (intersect, union)
-lub = lattice (TLub, TGlb) (TTop, TBot) (union, intersect)
+glbSimpl = curry $ \ case
+  (TGlb tvar typ1, typ2) -> Just $ TGlb tvar (glb typ1 typ2)
+  (typ1, TGlb tvar typ2) -> Just $ TGlb tvar (glb typ1 typ2)
+  _ -> Nothing
+
+lubSimpl = curry $ \ case
+  (TLub tvar typ1, typ2) -> Just $ TLub tvar (lub typ1 typ2)
+  (typ1, TLub tvar typ2) -> Just $ TLub tvar (lub typ1 typ2)
+  _ -> Nothing
+
+glb = lattice (TGlb, TLub) (TBot, TTop) (intersect, union) (glbSimpl, lubSimpl)
+lub = lattice (TLub, TGlb) (TTop, TBot) (union, intersect) (lubSimpl, glbSimpl)
 
 data Cmp = Eq | Lt | Gt | Nc deriving (Eq, Ord, Show)
 
@@ -262,13 +278,14 @@ cantSuper = \ case
   _ -> False
 
 ensureSubOf = flip ensureSub
+ensureSuperOf = ensureSub
 
 -- TODO: should this return the resulting subtype?
 ensureSub :: Typ -> Typ -> State ([TVar], EEnv, TEnv) ()
 ensureSub = curry . (. debug True "ensureSub") $ substs >=> \ case
   (TPrim, TPrim) -> pure ()
-  (TVar tvar, typ) -> boundTVar tvar $ mkBound TBot typ
-  (typ, TVar tvar) -> boundTVar tvar $ mkBound typ TTop
+  (TVar tvar, typ) -> boundTVarAbove tvar typ
+  (typ, TVar tvar) -> boundTVarBelow tvar $ typ
   (TFun typX1 typY1, TFun typX2 typY2) ->
     ensureSub typX2 typX1 *> ensureSub typY1 typY2
   (TSum typs1, TSum typs2) ->
@@ -336,6 +353,8 @@ withEVar evar action = do
     Nothing -> pure ()
     Just typOld -> subst typOld >>= modifyEEnv . M.insert evar
   pure result
+
+boundTVar above = 
 
 boundTVar tvar bound =
   if tvar `isFreeTVarIn` bound
