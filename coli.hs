@@ -7,13 +7,16 @@
 
 module Coli where
 
+import Useful
+import UnionFind
+
 import Prelude hiding (exp, lookup, all)
 import Control.Applicative
 import Control.Monad
 import Control.Monad.Reader
 import Control.Monad.ST
+import Control.Monad.State
 import Data.Foldable
-import Data.Maybe (fromMaybe)
 import Data.STRef
 import Data.Traversable
 import Data.Tuple
@@ -47,6 +50,7 @@ data Exp =
 
 data Typ =
     TPrim
+  | TVar Var
   | TFun Typ Typ
   | TSum (M.Map Nm Typ)
   | TProd (M.Map Nm Typ)
@@ -67,8 +71,11 @@ data Val =
 {-
 
 Abbreviations:
-  typ = TYPe
-  exp = EXPression
+  exp = expression
+  typ = type (which we avoid because it's a Haskell keyword)
+  val = value
+  inf = inference
+  env = environment
 
 Tags:
   X = argument of a function (e.g. TFun typX typY)
@@ -82,30 +89,6 @@ In effectful code, use
 I've grown accustomed to SML's fn, thus the extensive \ case use....
 
 -}
-
-
--- General
-
-(.:) :: (c -> d) -> (a -> b -> c) -> a -> b -> d
-(.:) = fmap . fmap
-
-lookup key = fromMaybe (error $ "no entry for " ++ key) . M.lookup key
-
-data OneOrTwo a = Fst a | Snd a | Both a a
-
-onBoth f = \ case
-  Fst x -> x
-  Snd y -> y
-  Both x y -> f x y
-
-union m1 m2 = M.unionWith both (fmap Fst m1) (fmap Snd m2)
-  where both (Fst x) (Snd y) = Both x y
-
-intersect = M.intersectionWith Both
-
-unreachable = error "unreachable"
-
-debug on prefix x = if on then trace (prefix ++ ": " ++ show x) x else x
 
 
 -- Expression Evaluation
@@ -158,23 +141,23 @@ runEval = flip runReader M.empty . eval
 
 data Inf s =
     IPrim
-  | IUnknown
-  | IRef (STRef s (Inf s))
   | IFun (Inf s) (Inf s)
   | ISum (M.Map Nm (Inf s))
   | IProd (M.Map Nm (Inf s))
-  deriving (Eq)
+  | IMyst (Ufr s (Myst s))
 
-data Constraint s = Inf s :<: Inf s
+data Myst s = MVar Var | MInf (Inf s)
+
+data Constraint a = a :<: a deriving (Eq, Ord, Show)
 
 -- Order explicit throughout because subst and infer don't commute.
-infer :: Exp -> forall s. ReaderT (Env (Inf s)) (ST s) (Inf s)
-infer = (. debug True "infer") $ \ case
-  EPrim _ -> pure IPrim
+infer :: Exp -> forall s. ReaderT (Env (Inf s)) (StateT [Var] (ST s)) (Inf s)
+infer = (. debug "infer") $ \ case
+  EPrim _ -> return IPrim
   EVar var -> lookup var <$> getEnv
   EOp op expL expR -> do
-    infer expL >>= ensure . (:<: IPrim)
-    infer expR >>= ensure . (:<: IPrim)
+    infer expL >>= lift2 . ensure . (:<: IPrim)
+    infer expR >>= lift2 . ensure . (:<: IPrim)
     return IPrim
   EFun var exp -> do
     typX <- unknown
@@ -182,18 +165,18 @@ infer = (. debug True "infer") $ \ case
   EApp expF expX -> do
     typX <- infer expX
     typY <- unknown
-    infer expF >>= ensure . (:<: IFun typX typY)
+    infer expF >>= lift2 . ensure . (:<: IFun typX typY)
     return typY
   ELet var expX expY -> do
     typX <- unknown
-    withVar var typX $ infer expX >>= ensure . (:<: typX) >> infer expY
+    withVar var typX $ infer expX >>= lift2 . ensure . (:<: typX) >> infer expY
   EBranch expI expT expE -> do
-    infer expI >>= ensure . (:<: IPrim)
+    infer expI >>= lift2 . ensure . (:<: IPrim)
     typT <- infer expT
     typE <- infer expE
     typ <- unknown
-    ensure $ typT :<: typ
-    ensure $ typE :<: typ
+    lift2 . ensure $ typT :<: typ
+    lift2 . ensure $ typE :<: typ
     return typ
   ESum nm exp -> ISum . M.singleton nm <$> infer exp
   -- ECase expX expsF -> do
@@ -203,9 +186,70 @@ infer = (. debug True "infer") $ \ case
   EProd exps -> IProd <$> traverse infer exps
   EProj nm exp -> do
     typ <- unknown
-    infer exp >>= ensure . (:<: IProd (M.fromList [(nm, typ)]))
+    infer exp >>= lift2 . ensure . (:<: IProd (M.fromList [(nm, typ)]))
     return typ
 
-ensure = undefined
+lift2 = lift . lift
 
-unknown = undefined
+unknown = do
+  (var : vars) <- lift get
+  lift $ put vars
+  lift2 $ IMyst <$> newUfr (MVar var)
+
+ensure (typ1 :<: typ2) =
+  ((:<:) <$> typOfInf typ1 <*> typOfInf typ2) >>=
+  -- TODO: be less evil....
+  (\ x -> debug "ensure" x `seq` ensure' (typ1 :<: typ2))
+
+-- TODO: deal with structural subtyping.
+ensure' = \ case
+  IPrim :<: IPrim -> pure ()
+  IFun typX1 typY1 :<: IFun typX2 typY2 ->
+    ensure (typX2 :<: typX1) *> ensure (typY1 :<: typY2)
+  ISum typs1 :<: ISum typs2 ->
+    traverse_ ensureSum $ union typs1 typs2
+  IProd typs1 :<: IProd typs2 ->
+    traverse_ ensureProd $ union typs1 typs2
+  IMyst mystr1 :<: IMyst mystr2 -> ensureMyst mystr1 mystr2
+  IMyst mystr1 :<: typ2 -> do
+    myst1 <- readUfr mystr1
+    case myst1 of
+      MVar _ -> writeUfr mystr1 $ MInf typ2
+      MInf typ1 -> ensure $ typ1 :<: typ2
+  typ1 :<: IMyst mystr2 -> do
+    myst2 <- readUfr mystr2
+    case myst2 of
+      MVar _ -> writeUfr mystr2 $ MInf typ1
+      MInf typ2 -> ensure $ typ1 :<: typ2
+  where
+    ensureSum = \case
+      Fst _ -> error "ensureSum"
+      Snd _ -> pure ()
+      Both typ1 typ2 -> ensure $ typ1 :<: typ2
+    ensureProd = \case
+      Fst _ -> pure ()
+      Snd _ -> error "ensureProd"
+      Both typ1 typ2 -> ensure $ typ1 :<: typ2
+    -- TODO
+    ensureMyst = mergeUfr . curry $ \ case
+      (MVar _, myst) -> pure myst
+      (myst, MVar _) -> pure myst
+      (MInf typ1, MInf typ2) -> ensure (typ1 :<: typ2) *> pure (MInf typ2)
+
+typOfInf :: Inf s -> ST s Typ
+typOfInf = \ case
+  IPrim -> pure TPrim
+  IMyst mystr -> readUfr mystr >>= \ case
+                 MVar var -> pure $ TVar var
+                 MInf typ -> typOfInf typ
+  IFun typX typY -> TFun <$> typOfInf typX <*> typOfInf typY
+  ISum typs -> TSum <$> traverse typOfInf typs
+  IProd typs -> TProd <$> traverse typOfInf typs
+
+vars = map (('t':) . show) [0..]
+
+runInfer exp = runST ((>>= typOfInf)
+                      . flip evalStateT vars
+                      . flip runReaderT M.empty
+                      $ infer exp
+                      :: forall s. ST s Typ)
