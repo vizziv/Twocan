@@ -148,16 +148,14 @@ data Inf s =
 
 data Myst s = MVar Var | MInf (Inf s)
 
-data Constraint a = a :<: a deriving (Eq, Ord, Show)
-
 -- Order explicit throughout because subst and infer don't commute.
 infer :: Exp -> forall s. ReaderT (Env (Inf s)) (StateT [Var] (ST s)) (Inf s)
 infer = (. debug "infer") $ \ case
   EPrim _ -> return IPrim
   EVar var -> lookup var <$> getEnv
   EOp op expL expR -> do
-    infer expL >>= lift2 . ensure . (:<: IPrim)
-    infer expR >>= lift2 . ensure . (:<: IPrim)
+    infer expL >>= lift2 . unify IPrim
+    infer expR >>= lift2 . unify IPrim
     return IPrim
   EFun var exp -> do
     typX <- unknown
@@ -165,18 +163,18 @@ infer = (. debug "infer") $ \ case
   EApp expF expX -> do
     typX <- infer expX
     typY <- unknown
-    infer expF >>= lift2 . ensure . (:<: IFun typX typY)
+    infer expF >>= lift2 . unify (IFun typX typY)
     return typY
   ELet var expX expY -> do
     typX <- unknown
-    withVar var typX $ infer expX >>= lift2 . ensure . (:<: typX) >> infer expY
+    withVar var typX $ infer expX >>= lift2 . unify typX >> infer expY
   EBranch expI expT expE -> do
-    infer expI >>= lift2 . ensure . (:<: IPrim)
+    infer expI >>= lift2 . unify IPrim
     typT <- infer expT
     typE <- infer expE
     typ <- unknown
-    lift2 . ensure $ typT :<: typ
-    lift2 . ensure $ typE :<: typ
+    lift2 $ unify typT typ
+    lift2 $ unify typE typ
     return typ
   ESum nm exp -> ISum . M.singleton nm <$> infer exp
   -- ECase expX expsF -> do
@@ -186,7 +184,7 @@ infer = (. debug "infer") $ \ case
   EProd exps -> IProd <$> traverse infer exps
   EProj nm exp -> do
     typ <- unknown
-    infer exp >>= lift2 . ensure . (:<: IProd (M.fromList [(nm, typ)]))
+    infer exp >>= lift2 . unify (IProd (M.fromList [(nm, typ)]))
     return typ
 
 lift2 = lift . lift
@@ -196,45 +194,45 @@ unknown = do
   lift $ put vars
   lift2 $ IMyst <$> newUfr (MVar var)
 
-ensure (typ1 :<: typ2) =
-  ((:<:) <$> typOfInf typ1 <*> typOfInf typ2) >>=
+unify typ1 typ2 =
+  ((,) <$> typOfInf typ1 <*> typOfInf typ2) >>=
   -- TODO: be less evil....
-  (\ x -> debug "ensure" x `seq` ensure' (typ1 :<: typ2))
+  (\ x -> debug "unify" x `seq` unify' (typ1, typ2))
 
 -- TODO: deal with structural subtyping.
-ensure' = \ case
-  IPrim :<: IPrim -> pure ()
-  IFun typX1 typY1 :<: IFun typX2 typY2 ->
-    ensure (typX2 :<: typX1) *> ensure (typY1 :<: typY2)
-  ISum typs1 :<: ISum typs2 ->
-    traverse_ ensureSum $ union typs1 typs2
-  IProd typs1 :<: IProd typs2 ->
-    traverse_ ensureProd $ union typs1 typs2
-  IMyst mystr1 :<: IMyst mystr2 -> ensureMyst mystr1 mystr2
-  IMyst mystr1 :<: typ2 -> do
+unify' = \ case
+  (IPrim, IPrim) -> pure ()
+  (IFun typX1 typY1, IFun typX2 typY2) ->
+    unify typX2 typX1 *> unify typY1 typY2
+  (ISum typs1, ISum typs2) ->
+    traverse_ unifySum $ union typs1 typs2
+  (IProd typs1, IProd typs2) ->
+    traverse_ unifyProd $ union typs1 typs2
+  (IMyst mystr1, IMyst mystr2) -> unifyMyst mystr1 mystr2
+  (IMyst mystr1, typ2) -> do
     myst1 <- readUfr mystr1
     case myst1 of
       MVar _ -> writeUfr mystr1 $ MInf typ2
-      MInf typ1 -> ensure $ typ1 :<: typ2
-  typ1 :<: IMyst mystr2 -> do
+      MInf typ1 -> unify typ1 typ2
+  (typ1, IMyst mystr2) -> do
     myst2 <- readUfr mystr2
     case myst2 of
       MVar _ -> writeUfr mystr2 $ MInf typ1
-      MInf typ2 -> ensure $ typ1 :<: typ2
+      MInf typ2 -> unify typ1 typ2
   where
-    ensureSum = \case
-      Fst _ -> error "ensureSum"
+    unifySum = \case
+      Fst _ -> error "unifySum"
       Snd _ -> pure ()
-      Both typ1 typ2 -> ensure $ typ1 :<: typ2
-    ensureProd = \case
+      Both typ1 typ2 -> unify typ1 typ2
+    unifyProd = \case
       Fst _ -> pure ()
-      Snd _ -> error "ensureProd"
-      Both typ1 typ2 -> ensure $ typ1 :<: typ2
+      Snd _ -> error "unifyProd"
+      Both typ1 typ2 -> unify typ1 typ2
     -- TODO
-    ensureMyst = mergeUfr . curry $ \ case
+    unifyMyst = mergeUfr . curry $ \ case
       (MVar _, myst) -> pure myst
       (myst, MVar _) -> pure myst
-      (MInf typ1, MInf typ2) -> ensure (typ1 :<: typ2) *> pure (MInf typ2)
+      (MInf typ1, MInf typ2) -> unify typ1 typ2 *> pure (MInf typ2)
 
 typOfInf :: Inf s -> ST s Typ
 typOfInf = \ case
