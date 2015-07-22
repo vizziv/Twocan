@@ -1,6 +1,6 @@
 module Example where
 
-import Coli
+import Twocan
 import qualified Data.Map as M
 
 exp_F = EFun "x" $ EOp Over (EOp Plus (EVar "x") (EPrim 51)) (EPrim 2)

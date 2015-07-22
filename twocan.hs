@@ -5,7 +5,7 @@
   RankNTypes,
   ExplicitForAll #-}
 
-module Coli where
+module Twocan where
 
 import Useful
 import UnionFind
