@@ -15,6 +15,7 @@ import Control.Applicative
 import Control.Monad
 import Control.Monad.Reader
 import Control.Monad.ST
+import Control.Monad.ST.Class
 import Control.Monad.State
 import Data.Foldable
 import Data.STRef
@@ -148,14 +149,13 @@ data Inf s =
 
 data Myst s = MVar Var | MInf (Inf s)
 
--- Order explicit throughout because subst and infer don't commute.
 infer :: Exp -> forall s. ReaderT (Env (Inf s)) (StateT [Var] (ST s)) (Inf s)
 infer = (. debug "infer") $ \ case
   EPrim _ -> return IPrim
   EVar var -> lookup var <$> getEnv
   EOp op expL expR -> do
-    infer expL >>= lift2 . unify IPrim
-    infer expR >>= lift2 . unify IPrim
+    infer expL >>= liftST . unify IPrim
+    infer expR >>= liftST . unify IPrim
     return IPrim
   EFun var exp -> do
     typX <- unknown
@@ -163,18 +163,18 @@ infer = (. debug "infer") $ \ case
   EApp expF expX -> do
     typX <- infer expX
     typY <- unknown
-    infer expF >>= lift2 . unify (IFun typX typY)
+    infer expF >>= liftST . unify (IFun typX typY)
     return typY
   ELet var expX expY -> do
     typX <- unknown
-    withVar var typX $ infer expX >>= lift2 . unify typX >> infer expY
+    withVar var typX $ infer expX >>= liftST . unify typX >> infer expY
   EBranch expI expT expE -> do
-    infer expI >>= lift2 . unify IPrim
+    infer expI >>= liftST . unify IPrim
     typT <- infer expT
     typE <- infer expE
     typ <- unknown
-    lift2 $ unify typT typ
-    lift2 $ unify typE typ
+    liftST $ unify typT typ
+    liftST $ unify typE typ
     return typ
   ESum nm exp -> ISum . M.singleton nm <$> infer exp
   -- ECase expX expsF -> do
@@ -184,15 +184,13 @@ infer = (. debug "infer") $ \ case
   EProd exps -> IProd <$> traverse infer exps
   EProj nm exp -> do
     typ <- unknown
-    infer exp >>= lift2 . unify (IProd (M.fromList [(nm, typ)]))
+    infer exp >>= liftST . unify (IProd (M.fromList [(nm, typ)]))
     return typ
 
-lift2 = lift . lift
-
 unknown = do
-  (var : vars) <- lift get
-  lift $ put vars
-  lift2 $ IMyst <$> newUfr (MVar var)
+  (var : vars) <- get
+  put vars
+  liftST $ IMyst <$> newUfr (MVar var)
 
 unify typ1 typ2 =
   ((,) <$> typOfInf typ1 <*> typOfInf typ2) >>=
