@@ -231,7 +231,7 @@ unify' = \ case
     -- TODO
     unifyMyst mystr1 mystr2 =
       (,) <$> readUfr mystr1 <*> readUfr mystr2 >>= \ case
-        (MVar _, MVar _) -> mergeUfr (pure .: const) mystr1 mystr2
+        (MVar _, MVar _) -> mergeUfr const mystr1 mystr2
         (MVar _, MInf typ2) -> writeInf mystr1 typ2
         (MInf typ1, MVar _) -> writeInf mystr2 typ1
         (MInf typ1, MInf typ2) -> unify typ1 typ2

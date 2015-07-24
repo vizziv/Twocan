@@ -54,7 +54,7 @@ mergeUfr op (Ufr pathrFirst1) (Ufr pathrFirst2) = do
                                             LT -> (pathr2, pathr1, rank2)
                                             EQ -> (pathr1, pathr2, rank1 + 1)
                                             GT -> (pathr1, pathr2, rank1)
-    x <- op x1 x2
+    let x = op x1 x2
     writeSTRef pathrChild (PStep pathrParent)
     writeSTRef pathrParent (PEnd rank x)
 
@@ -77,4 +77,4 @@ unionFindTest = runST $ do
                         <*> equalUfr a b
                         <*> equalUfr c e
                         <*> equalUfr f b
-  where merge = mergeUfr $ pure .: (++)
+  where merge = mergeUfr (++)
