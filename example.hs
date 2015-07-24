@@ -87,3 +87,7 @@ mkList = foldr (\ x xs -> ESum "Cons" . EProd $ M.fromList
                (ESum "Nil" exp_Unit)
 
 exp_Map_Fact_125 = EApp (EApp exp_Map exp_Fact) $ mkList $ map EPrim [1,2,5]
+
+exp_IdPoly = ELet "id"
+             (EFun "x" (EVar "x"))
+             (EApp (EApp (EVar "id") (EVar "id")) (EPrim 42))

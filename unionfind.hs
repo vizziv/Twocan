@@ -3,7 +3,9 @@
   LambdaCase,
   RankNTypes #-}
 
-module UnionFind (Ufr, newUfr, readUfr, writeUfr, modifyUfr, mergeUfr) where
+module UnionFind
+  (Ufr, newUfr, readUfr, writeUfr, modifyUfr, mergeUfr, equalUfr)
+  where
 
 import Control.Applicative
 import Control.Monad
@@ -56,6 +58,9 @@ mergeUfr op (Ufr pathrFirst1) (Ufr pathrFirst2) = do
     writeSTRef pathrChild (PStep pathrParent)
     writeSTRef pathrParent (PEnd rank x)
 
+equalUfr (Ufr pathr1) (Ufr pathr2) =
+  (==) <$> lastPathr pathr1 <*> lastPathr pathr2
+
 unionFindTest = runST $ do
                   a <- newUfr "a"
                   b <- newUfr "b"
@@ -68,5 +73,8 @@ unionFindTest = runST $ do
                   merge a g
                   merge e f
                   merge e b
-                  mapM readUfr [a,b,c,d,e,f,g]
+                  (,,,) <$> mapM readUfr [a,b,c,d,e,f,g]
+                        <*> equalUfr a b
+                        <*> equalUfr c e
+                        <*> equalUfr f b
   where merge = mergeUfr $ pure .: (++)

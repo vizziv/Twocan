@@ -10,7 +10,7 @@ module Twocan where
 import Useful
 import UnionFind
 
-import Prelude hiding (exp, lookup, all)
+import Prelude hiding (exp, lookup, any, all)
 import Control.Applicative
 import Control.Monad
 import Control.Monad.Reader
@@ -18,6 +18,7 @@ import Control.Monad.ST
 import Control.Monad.ST.Class
 import Control.Monad.State
 import Data.Foldable
+import Data.Monoid
 import Data.STRef
 import Data.Traversable
 import Data.Tuple
@@ -154,8 +155,8 @@ infer = (. debug "infer") $ \ case
   EPrim _ -> return IPrim
   EVar var -> lookup var <$> getEnv
   EOp op expL expR -> do
-    infer expL >>= liftST . unify IPrim
-    infer expR >>= liftST . unify IPrim
+    infer expL >>= unify IPrim
+    infer expR >>= unify IPrim
     return IPrim
   EFun var exp -> do
     typX <- unknown
@@ -163,18 +164,18 @@ infer = (. debug "infer") $ \ case
   EApp expF expX -> do
     typX <- infer expX
     typY <- unknown
-    infer expF >>= liftST . unify (IFun typX typY)
+    infer expF >>= unify (IFun typX typY)
     return typY
   ELet var expX expY -> do
     typX <- unknown
-    withVar var typX $ infer expX >>= liftST . unify typX >> infer expY
+    withVar var typX $ infer expX >>= unify typX >> infer expY
   EBranch expI expT expE -> do
-    infer expI >>= liftST . unify IPrim
+    infer expI >>= unify IPrim
     typT <- infer expT
     typE <- infer expE
     typ <- unknown
-    liftST $ unify typT typ
-    liftST $ unify typE typ
+    unify typT typ
+    unify typE typ
     return typ
   ESum nm exp -> ISum . M.singleton nm <$> infer exp
   -- ECase expX expsF -> do
@@ -184,7 +185,7 @@ infer = (. debug "infer") $ \ case
   EProd exps -> IProd <$> traverse infer exps
   EProj nm exp -> do
     typ <- unknown
-    infer exp >>= liftST . unify (IProd (M.fromList [(nm, typ)]))
+    infer exp >>= unify (IProd (M.fromList [(nm, typ)]))
     return typ
 
 unknown = do
@@ -192,7 +193,8 @@ unknown = do
   put vars
   liftST $ IMyst <$> newUfr (MVar var)
 
-unify typ1 typ2 =
+unify :: MonadST f => Inf (World f) -> Inf (World f) -> f ()
+unify typ1 typ2 = liftST $
   ((,) <$> typOfInf typ1 <*> typOfInf typ2) >>=
   -- TODO: be less evil....
   (\ x -> debug "unify" x `seq` unify' (typ1, typ2))
@@ -210,37 +212,55 @@ unify' = \ case
   (IMyst mystr1, typ2) -> do
     myst1 <- readUfr mystr1
     case myst1 of
-      MVar _ -> writeUfr mystr1 $ MInf typ2
+      MVar _ -> writeInf mystr1 typ2
       MInf typ1 -> unify typ1 typ2
   (typ1, IMyst mystr2) -> do
     myst2 <- readUfr mystr2
     case myst2 of
-      MVar _ -> writeUfr mystr2 $ MInf typ1
+      MVar _ -> writeInf mystr2 typ1
       MInf typ2 -> unify typ1 typ2
   where
-    unifySum = \case
+    unifySum = \ case
       Fst _ -> error "unifySum"
       Snd _ -> pure ()
       Both typ1 typ2 -> unify typ1 typ2
-    unifyProd = \case
+    unifyProd = \ case
       Fst _ -> pure ()
       Snd _ -> error "unifyProd"
       Both typ1 typ2 -> unify typ1 typ2
     -- TODO
-    unifyMyst = mergeUfr . curry $ \ case
-      (MVar _, myst) -> pure myst
-      (myst, MVar _) -> pure myst
-      (MInf typ1, MInf typ2) -> unify typ1 typ2 *> pure (MInf typ2)
+    unifyMyst mystr1 mystr2 =
+      (,) <$> readUfr mystr1 <*> readUfr mystr2 >>= \ case
+        (MVar _, MVar _) -> mergeUfr (pure .: const) mystr1 mystr2
+        (MVar _, MInf typ2) -> writeInf mystr1 typ2
+        (MInf typ1, MVar _) -> writeInf mystr2 typ1
+        (MInf typ1, MInf typ2) -> unify typ1 typ2
+
+writeInf mystr typ = do
+  infinite <- appearsIn typ
+  if debug "infinite" infinite
+  then error "unify: infinite type"
+  else writeUfr mystr $ MInf typ
+  where
+    appearsIn = \ case
+      IPrim -> pure False
+      IFun typX typY -> (||) <$> appearsIn typX <*> appearsIn typY
+      ISum typs -> any id <$> traverse appearsIn typs
+      IProd typs -> any id <$> traverse appearsIn typs
+      -- IMyst mystr -> IMyst <$> f mystr
+      IMyst mystrOther -> readUfr mystrOther >>= \ case
+                            MVar var -> equalUfr mystr mystrOther
+                            MInf typ -> appearsIn typ
 
 typOfInf :: Inf s -> ST s Typ
 typOfInf = \ case
   IPrim -> pure TPrim
-  IMyst mystr -> readUfr mystr >>= \ case
-                 MVar var -> pure $ TVar var
-                 MInf typ -> typOfInf typ
   IFun typX typY -> TFun <$> typOfInf typX <*> typOfInf typY
   ISum typs -> TSum <$> traverse typOfInf typs
   IProd typs -> TProd <$> traverse typOfInf typs
+  IMyst mystr -> readUfr mystr >>= \ case
+                   MVar var -> pure $ TVar var
+                   MInf typ -> typOfInf typ
 
 vars = map (('t':) . show) [0..]
 
