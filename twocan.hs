@@ -10,7 +10,7 @@ module Twocan where
 import Useful
 import UnionFind
 
-import Prelude hiding (exp, lookup, any, all)
+import Prelude hiding (exp, lookup, any, all, foldl, foldr)
 import Control.Applicative
 import Control.Monad
 import Control.Monad.Reader
@@ -23,6 +23,7 @@ import Data.STRef
 import Data.Traversable
 import Data.Tuple
 import qualified Data.Map as M
+import qualified Data.Set as S
 import Debug.Trace
 
 
@@ -143,17 +144,19 @@ runEval = flip runReader M.empty . eval
 
 data Inf s =
     IPrim
+  -- Only used in type environment ("between" generalize and specialize).
+  | IVar Var
   | IFun (Inf s) (Inf s)
   | ISum (M.Map Nm (Inf s))
   | IProd (M.Map Nm (Inf s))
   | IMyst (Ufr s (Myst s))
 
-data Myst s = MVar Var | MInf (Inf s)
+data Myst s = MFree Var | MVar Var | MInf (Inf s)
 
 infer :: Exp -> forall s. ReaderT (Env (Inf s)) (StateT [Var] (ST s)) (Inf s)
 infer = (. debug "infer") $ \ case
   EPrim _ -> return IPrim
-  EVar var -> lookup var <$> getEnv
+  EVar var -> lookup var <$> getEnv >>= specialize
   EOp op expL expR -> do
     infer expL >>= unify IPrim
     infer expR >>= unify IPrim
@@ -168,7 +171,9 @@ infer = (. debug "infer") $ \ case
     return typY
   ELet var expX expY -> do
     typX <- unknown
-    withVar var typX $ infer expX >>= unify typX >> infer expY
+    withVar var typX $ infer expX >>= unify typX
+    typXGen <- generalize typX
+    withVar var typXGen $ infer expY
   EBranch expI expT expE -> do
     infer expI >>= unify IPrim
     typT <- infer expT
@@ -188,6 +193,7 @@ infer = (. debug "infer") $ \ case
     infer exp >>= unify (IProd (M.fromList [(nm, typ)]))
     return typ
 
+unknown :: ReaderT (Env (Inf s)) (StateT [Var] (ST s)) (Inf s)
 unknown = do
   (var : vars) <- get
   put vars
@@ -236,6 +242,55 @@ unify' = \ case
         (MInf typ1, MVar _) -> writeInf mystr2 typ1
         (MInf typ1, MInf typ2) -> unify typ1 typ2
 
+generalize :: Inf s -> ReaderT (Env (Inf s)) (StateT [Var] (ST s)) (Inf s)
+generalize typGen = do
+  boundVars <- envBoundVars
+  let gen = \ case
+        IPrim -> pure IPrim
+        IFun typX typY -> IFun <$> gen typX <*> gen typY
+        ISum typs -> ISum <$> traverse gen typs
+        IProd typs -> IProd <$> traverse gen typs
+        IMyst mystr -> liftST (readUfr mystr) >>= \ case
+                         MVar var -> pure $ if S.member var boundVars
+                                            then IMyst mystr
+                                            else IVar var
+                         MInf typ -> gen typ
+  typ <- gen typGen
+  -- TODO: stop continuing not being less evil....
+  liftST (typOfInf typ) >>= (\typDebug -> debug "generalized" typDebug `seq` pure typ)
+  where
+    envBoundVars :: ReaderT (Env (Inf s)) (StateT [Var] (ST s)) (S.Set Var)
+    envBoundVars =
+      getEnv >>= foldlM (\vars typ -> S.union vars <$> typBoundVars typ) S.empty
+    typBoundVars = \ case
+      IPrim -> pure S.empty
+      IVar _ -> pure S.empty
+      IFun typX typY -> S.union <$> typBoundVars typX <*> typBoundVars typY
+      ISum typs -> foldl S.union S.empty <$> traverse typBoundVars typs
+      IProd typs -> foldl S.union S.empty <$> traverse typBoundVars typs
+      IMyst mystr -> liftST (readUfr mystr) >>= \ case
+                       MVar var -> pure $ S.singleton var
+                       MInf typ -> typBoundVars typ
+
+specialize :: Inf s -> ReaderT (Env (Inf s)) (StateT [Var] (ST s)) (Inf s)
+specialize = flip evalStateT M.empty . spc
+  where
+    spc :: Inf s -> StateT (Env (Inf s)) (ReaderT (Env (Inf s)) (StateT [Var] (ST s))) (Inf s)
+    spc = \ case
+      IPrim -> pure IPrim
+      IVar var -> M.lookup var <$> get >>= \ case
+                    Nothing -> do
+                      typ <- lift unknown
+                      modify $ M.insert var typ
+                      pure typ
+                    Just typ -> pure typ
+      IFun typX typY -> IFun <$> spc typX <*> spc typY
+      ISum typs -> ISum <$> traverse spc typs
+      IProd typs -> IProd <$> traverse spc typs
+      IMyst mystr -> liftST (readUfr mystr) >>= \ case
+                       MVar var -> pure $ IMyst mystr
+                       MInf typ -> spc typ
+
 writeInf mystr typ = do
   infinite <- appearsIn typ
   if debug "infinite" infinite
@@ -255,11 +310,12 @@ writeInf mystr typ = do
 typOfInf :: Inf s -> ST s Typ
 typOfInf = \ case
   IPrim -> pure TPrim
+  IVar var -> pure $ TVar var
   IFun typX typY -> TFun <$> typOfInf typX <*> typOfInf typY
   ISum typs -> TSum <$> traverse typOfInf typs
   IProd typs -> TProd <$> traverse typOfInf typs
   IMyst mystr -> readUfr mystr >>= \ case
-                   MVar var -> pure $ TVar var
+                   MVar var -> pure $ TVar ('_':var)
                    MInf typ -> typOfInf typ
 
 vars = map (('t':) . show) [0..]

@@ -70,24 +70,29 @@ exp_FibWithCase =
         ("F0", EPrim 0),
         ("F1", EPrim 1)])))
 
-exp_Map = EFun "f"
-          (ELet "map"
-           (EFun "xs"
-            (ECase (EVar "xs") $ M.fromList
-             [("Nil", EFun "_" (EVar "xs")),
-              ("Cons",
-               EFun "cons"
-               (EProd $ M.fromList
-                [("Head", EApp (EVar "f") (EProj "Head" (EVar "cons"))),
-                 ("Tail", EApp (EVar "map") (EProj "Tail" (EVar "cons")))]))]))
-           (EVar "map"))
+exp_Map =
+  EFun "f"
+  (ELet "map"
+  (EFun "xs"
+   (ECase (EVar "xs") $ M.fromList
+    [("Nil", EFun "_" (EVar "xs")),
+     ("Cons",
+      EFun "cons"
+      (EProd $ M.fromList
+       [("Head", EApp (EVar "f") (EProj "Head" (EVar "cons"))),
+        ("Tail", EApp (EVar "map") (EProj "Tail" (EVar "cons")))]))]))
+  (EVar "map"))
 
 mkList = foldr (\ x xs -> ESum "Cons" . EProd $ M.fromList
                 [("Head", x), ("Tail", xs)])
-               (ESum "Nil" exp_Unit)
+         (ESum "Nil" exp_Unit)
 
 exp_Map_Fact_125 = EApp (EApp exp_Map exp_Fact) $ mkList $ map EPrim [1,2,5]
 
 exp_IdPoly = ELet "id"
              (EFun "x" (EVar "x"))
              (EApp (EApp (EVar "id") (EVar "id")) (EPrim 42))
+
+exp_ApplyTwicePoly = ELet "app2"
+                     exp_ApplyTwice
+                     (EApp (EApp (EVar "app2") (EVar "app2")) exp_Fact)
