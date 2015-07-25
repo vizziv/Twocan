@@ -10,6 +10,7 @@ module UnionFind
 import Control.Applicative
 import Control.Monad
 import Control.Monad.ST
+import Control.Monad.ST.Class
 import Data.STRef
 
 import Useful
@@ -37,12 +38,12 @@ modifyPathr pathr f = do
     PEnd rank x -> PEnd rank (f x)
     _ -> error "modifyPathr: lastPathr didn't return a PEnd"
 
-newUfr x = Ufr <$> newSTRef (PEnd 0 x)
-readUfr = readPathr . fromUfr
-modifyUfr = modifyPathr . fromUfr
+newUfr x = liftST $ Ufr <$> newSTRef (PEnd 0 x)
+readUfr = liftST . readPathr . fromUfr
+modifyUfr = liftST .: modifyPathr . fromUfr
 writeUfr ufr = modifyUfr ufr . const
 
-mergeUfr op (Ufr pathrFirst1) (Ufr pathrFirst2) = do
+mergeUfr op (Ufr pathrFirst1) (Ufr pathrFirst2) = liftST $ do
   pathr1 <- lastPathr pathrFirst1
   pathr2 <- lastPathr pathrFirst2
   if pathr1 == pathr2
@@ -59,7 +60,7 @@ mergeUfr op (Ufr pathrFirst1) (Ufr pathrFirst2) = do
     writeSTRef pathrParent (PEnd rank x)
 
 equalUfr (Ufr pathr1) (Ufr pathr2) =
-  (==) <$> lastPathr pathr1 <*> lastPathr pathr2
+  liftST $ (==) <$> lastPathr pathr1 <*> lastPathr pathr2
 
 unionFindTest = runST $ do
                   a <- newUfr "a"

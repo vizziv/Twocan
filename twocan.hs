@@ -12,19 +12,14 @@ import UnionFind
 
 import Prelude hiding (exp, lookup, any, all, foldl, foldr)
 import Control.Applicative
-import Control.Monad
 import Control.Monad.Reader
 import Control.Monad.ST
-import Control.Monad.ST.Class
 import Control.Monad.State
 import Data.Foldable
-import Data.Monoid
 import Data.STRef
 import Data.Traversable
-import Data.Tuple
 import qualified Data.Map as M
 import qualified Data.Set as S
-import Debug.Trace
 
 
 -- Language Definition
@@ -193,14 +188,12 @@ infer = (. debug "infer") $ \ case
     infer exp >>= unify (IProd (M.fromList [(nm, typ)]))
     return typ
 
-unknown :: ReaderT (Env (Inf s)) (StateT [Var] (ST s)) (Inf s)
 unknown = do
   (var : vars) <- get
   put vars
-  liftST $ IMyst <$> newUfr (MVar var)
+  IMyst <$> newUfr (MVar var)
 
-unify :: MonadST f => Inf (World f) -> Inf (World f) -> f ()
-unify typ1 typ2 = liftST $
+unify typ1 typ2 =
   ((,) <$> typOfInf typ1 <*> typOfInf typ2) >>=
   -- TODO: be less evil....
   (\ x -> debug "unify" x `seq` unify' (typ1, typ2))
@@ -242,7 +235,6 @@ unify' = \ case
         (MInf typ1, MVar _) -> writeInf mystr2 typ1
         (MInf typ1, MInf typ2) -> unify typ1 typ2
 
-generalize :: Inf s -> ReaderT (Env (Inf s)) (StateT [Var] (ST s)) (Inf s)
 generalize typGen = do
   boundVars <- envBoundVars
   let gen = \ case
@@ -250,14 +242,14 @@ generalize typGen = do
         IFun typX typY -> IFun <$> gen typX <*> gen typY
         ISum typs -> ISum <$> traverse gen typs
         IProd typs -> IProd <$> traverse gen typs
-        IMyst mystr -> liftST (readUfr mystr) >>= \ case
+        IMyst mystr -> readUfr mystr >>= \ case
                          MVar var -> pure $ if S.member var boundVars
                                             then IMyst mystr
                                             else IVar var
                          MInf typ -> gen typ
   typ <- gen typGen
   -- TODO: stop continuing not being less evil....
-  liftST (typOfInf typ) >>= (\typDebug -> debug "generalized" typDebug `seq` pure typ)
+  typOfInf typ >>= (\typDebug -> debug "generalized" typDebug `seq` pure typ)
   where
     envBoundVars :: ReaderT (Env (Inf s)) (StateT [Var] (ST s)) (S.Set Var)
     envBoundVars =
@@ -268,11 +260,11 @@ generalize typGen = do
       IFun typX typY -> S.union <$> typBoundVars typX <*> typBoundVars typY
       ISum typs -> foldl S.union S.empty <$> traverse typBoundVars typs
       IProd typs -> foldl S.union S.empty <$> traverse typBoundVars typs
-      IMyst mystr -> liftST (readUfr mystr) >>= \ case
+      IMyst mystr -> readUfr mystr >>= \ case
                        MVar var -> pure $ S.singleton var
                        MInf typ -> typBoundVars typ
 
-specialize :: Inf s -> ReaderT (Env (Inf s)) (StateT [Var] (ST s)) (Inf s)
+-- specialize :: Inf s -> ReaderT (Env (Inf s)) (StateT [Var] (ST s)) (Inf s)
 specialize = flip evalStateT M.empty . spc
   where
     spc :: Inf s -> StateT (Env (Inf s)) (ReaderT (Env (Inf s)) (StateT [Var] (ST s))) (Inf s)
@@ -280,6 +272,7 @@ specialize = flip evalStateT M.empty . spc
       IPrim -> pure IPrim
       IVar var -> M.lookup var <$> get >>= \ case
                     Nothing -> do
+                      -- Lift from the StateT [Var].
                       typ <- lift unknown
                       modify $ M.insert var typ
                       pure typ
@@ -287,7 +280,7 @@ specialize = flip evalStateT M.empty . spc
       IFun typX typY -> IFun <$> spc typX <*> spc typY
       ISum typs -> ISum <$> traverse spc typs
       IProd typs -> IProd <$> traverse spc typs
-      IMyst mystr -> liftST (readUfr mystr) >>= \ case
+      IMyst mystr -> readUfr mystr >>= \ case
                        MVar var -> pure $ IMyst mystr
                        MInf typ -> spc typ
 
@@ -307,7 +300,6 @@ writeInf mystr typ = do
                             MVar var -> equalUfr mystr mystrOther
                             MInf typ -> appearsIn typ
 
-typOfInf :: Inf s -> ST s Typ
 typOfInf = \ case
   IPrim -> pure TPrim
   IVar var -> pure $ TVar var
