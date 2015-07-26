@@ -264,7 +264,6 @@ generalize typGen = do
                        MVar var -> pure $ S.singleton var
                        MInf typ -> typBoundVars typ
 
--- specialize :: Inf s -> ReaderT (Env (Inf s)) (StateT [Var] (ST s)) (Inf s)
 specialize = flip evalStateT M.empty . spc
   where
     spc :: Inf s -> StateT (Env (Inf s)) (ReaderT (Env (Inf s)) (StateT [Var] (ST s))) (Inf s)
@@ -312,8 +311,10 @@ typOfInf = \ case
 
 vars = map (('t':) . show) [0..]
 
-runInfer exp = runST ((>>= typOfInf)
-                      . flip evalStateT vars
-                      . flip runReaderT M.empty
-                      $ infer exp
-                      :: forall s. ST s Typ)
+-- Eta-expansion enables inference of higher rank type needed for runST.
+runInfer exp =
+  runST $
+  (>>= typOfInf)
+  . flip evalStateT vars
+  . flip runReaderT M.empty
+  $ infer exp
