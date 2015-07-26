@@ -146,7 +146,7 @@ data Inf s =
   | IProd (M.Map Nm (Inf s))
   | IMyst (Ufr s (Myst s))
 
-data Myst s = MFree Var | MVar Var | MInf (Inf s)
+data Myst s = MVar Var | MInf (Inf s)
 
 infer :: Exp -> forall s. ReaderT (Env (Inf s)) (StateT [Var] (ST s)) (Inf s)
 infer = (. debug "infer") $ \ case
