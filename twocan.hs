@@ -48,21 +48,14 @@ data Exp =
 
 data Typ =
     TPrim
-  | TVar Var Kind
+  | TVar Var
   | TFun Typ Typ
-  | TSum (M.Map Nm Typ)
-  | TProd (M.Map Nm Typ)
+  | TSum (Limits Typ)
+  | TProd (Limits Typ)
   deriving (Eq, Ord, Show)
 
-data Kind =
-    KAny
-  | KSum Bound
-  | KProd Bound
-  -- A temporary KAny (w.r.t. writing this program, not executing it).
-  | KTmp
-  deriving (Eq, Ord, Show)
-
-type Bound = ((S.Set Nm), (Maybe (S.Set Nm)), (M.Map Nm Typ))
+-- Required fields, possible fields (Nothing = all allowed), types of fields.
+type Limits t = ((S.Set Nm), (Maybe (S.Set Nm)), (M.Map Nm t))
 
 type Env t = M.Map Var t
 
@@ -74,27 +67,39 @@ data Val =
   deriving (Eq, Ord, Show)
 
 
--- Conventions
+-- Naming Conventions
 
 {-
 
-Abbreviations:
+Sorts and modifiers are information that's usually coarser than a Haskell type.
+Tags give extra qualitative information that's usually finer than the type.
+These conventions are followed pretty consistently outside of top-level names.
+The lists below aren't necessarily exhaustive.
+
+Sorts:
   exp = expression
-  typ = type (which we avoid because it's a Haskell keyword)
+  typ = type (which we avoid writing in full because it's a Haskell keyword)
   val = value
-  inf = inference
+  var = variable
+  nm = name
   env = environment
+  prim = primitive
+
+Modifiers:
+  q = optional (q is for "question"): Maybe, Either
+  r = reference: Ufr, STRef
+  s = collection: [], S.Set, M.Map
 
 Tags:
-  X = argument of a function (e.g. TFun typX typY)
-  Y = result of a function (e.g. EFun evar expY)
-  F = function itself
+  F, X, Y = a function, its argument, its result
+  L, R = left, right
+  I, T, E = if, then, else
+  Req, Pos = required, possible (think "permissable")
+  1, 2, ... = generic disambiguation
 
-In effectful code, use
-  pure and *> when (almost) completely applicative,
-  return and >> when monadic or when resulting in much nicer infix precedence.
-
-I've grown accustomed to SML's fn, thus the extensive \ case use....
+Examples:
+  typF@(TFun typX typY) = types of a function, its argument, and its result
+  nmsqPos = optional collection of possible names
 
 -}
 
@@ -103,7 +108,7 @@ I've grown accustomed to SML's fn, thus the extensive \ case use....
 
 eval :: Exp -> Reader (Env Val) Val
 eval = \ case
-  EPrim prim -> return $ VPrim prim
+  EPrim prim -> pure $ VPrim prim
   EVar var -> lookup var <$> getEnv
   EOp op expL expR -> evalOp op <$> eval expL <*> eval expR
   EFun var exp -> VFun var exp <$> getEnv
@@ -113,7 +118,7 @@ eval = \ case
     apply valF valX
   ELet var expX expY -> do
     rec (valX, valY) <- withVar var valX $ (,) <$> eval expX <*> eval expY
-    return valY
+    pure valY
   EBranch expI expT expE -> do
     VPrim n <- eval expI
     eval $ if n <= 0 then expT else expE
@@ -125,7 +130,7 @@ eval = \ case
   EProd exps -> VProd <$> traverse eval exps
   EProj nm exp -> do
     (VProd vals) <- eval exp
-    return $ lookup nm vals
+    pure $ lookup nm vals
 
 apply (VFun var expY env) valX = withEnv env . withVar var valX $ eval expY
 
@@ -151,31 +156,22 @@ runEval = flip runReader M.empty . eval
 data TypInf s =
     TIPrim
   -- Only used in type environment ("between" generalize and specialize).
-  | TIVar Var (KindInf s)
+  | TIVar Var
   | TIFun (TypInf s) (TypInf s)
-  | TISum (M.Map Nm (TypInf s))
-  | TIProd (M.Map Nm (TypInf s))
+  | TISum (Limits (TypInf s))
+  | TIProd (Limits (TypInf s))
   | TIMyst (Ufr s (Myst s))
 
-data KindInf s =
-    KIAny
-  | KISum (BoundInf s)
-  | KIProd (BoundInf s)
-  -- A temporary KAny (w.r.t. writing this program, not executing it).
-  | KITmp
-
-type BoundInf s = ((S.Set Nm), (Maybe (S.Set Nm)), (M.Map Nm (TypInf s)))
-
-data Myst s = MVar Var (KindInf s) | MTypInf (TypInf s)
+data Myst s = MVar Var | MTypInf (TypInf s)
 
 infer :: Exp -> forall s. ReaderT (Env (TypInf s)) (StateT [Var] (ST s)) (TypInf s)
 infer = (. debug "infer") $ \ case
-  EPrim _ -> return TIPrim
+  EPrim _ -> pure TIPrim
   EVar var -> lookup var <$> getEnv >>= specialize
   EOp op expL expR -> do
     infer expL >>= unify TIPrim
     infer expR >>= unify TIPrim
-    return TIPrim
+    pure TIPrim
   EFun var exp -> do
     typX <- unknown
     withVar var typX $ TIFun typX <$> infer exp
@@ -183,7 +179,7 @@ infer = (. debug "infer") $ \ case
     typX <- infer expX
     typY <- unknown
     infer expF >>= unify (TIFun typX typY)
-    return typY
+    pure typY
   ELet var expX expY -> do
     typX <- unknown
     withVar var typX $ infer expX >>= unify typX
@@ -196,25 +192,25 @@ infer = (. debug "infer") $ \ case
     typ <- unknown
     unify typT typ
     unify typE typ
-    return typ
-  ESum nm exp -> TISum . M.singleton nm <$> infer exp
+    pure typ
+  -- ESum nm exp -> TISum . M.singleton nm <$> infer exp
   -- ECase expX expsF -> do
   --   typsF <- traverse infer expsF
   --   typX <- infer exp
   -- TODO: make new type variables, ensure things match up.
-  EProd exps -> TIProd <$> traverse infer exps
-  EProj nm exp -> do
-    typ <- unknown
-    infer exp >>= unify (TIProd (M.fromList [(nm, typ)]))
-    return typ
+  -- EProd exps -> TIProd <$> traverse infer exps
+  -- EProj nm exp -> do
+  --   typ <- unknown
+  --   infer exp >>= unify (TIProd (M.fromList [(nm, typ)]))
+  --   pure typ
 
 unknown = do
   (var : vars) <- get
   put vars
-  TIMyst <$> newUfr (MVar var KITmp)
+  TIMyst <$> newUfr (MVar var)
 
 unify typ1 typ2 =
-  ((,) <$> typOfTypInf typ1 <*> typOfTypInf typ2) >>=
+  ((,) <$> purify typ1 <*> purify typ2) >>=
   -- TODO: be less evil....
   (\ x -> debug "unify" x `seq` unify' (typ1, typ2))
 
@@ -223,20 +219,20 @@ unify' = \ case
   (TIPrim, TIPrim) -> pure ()
   (TIFun typX1 typY1, TIFun typX2 typY2) ->
     unify typX2 typX1 *> unify typY1 typY2
-  (TISum typs1, TISum typs2) ->
+  (TISum (_, _, typs1), TISum (_, _, typs2)) ->
     traverse_ unifySum $ union typs1 typs2
-  (TIProd typs1, TIProd typs2) ->
+  (TIProd (_, _, typs1), TIProd (_, _, typs2)) ->
     traverse_ unifyProd $ union typs1 typs2
   (TIMyst mystr1, TIMyst mystr2) -> unifyMyst mystr1 mystr2
   (TIMyst mystr1, typ2) -> do
     myst1 <- readUfr mystr1
     case myst1 of
-      MVar _ _ -> writeTypInf mystr1 typ2
+      MVar _ -> writeTypInf mystr1 typ2
       MTypInf typ1 -> unify typ1 typ2
   (typ1, TIMyst mystr2) -> do
     myst2 <- readUfr mystr2
     case myst2 of
-      MVar _ _ -> writeTypInf mystr2 typ1
+      MVar _ -> writeTypInf mystr2 typ1
       MTypInf typ2 -> unify typ1 typ2
   where
     unifySum = \ case
@@ -250,58 +246,58 @@ unify' = \ case
     -- TODO
     unifyMyst mystr1 mystr2 =
       (,) <$> readUfr mystr1 <*> readUfr mystr2 >>= \ case
-        (MVar _ _, MVar _ _) -> mergeUfr const mystr1 mystr2
-        (MVar _ _, MTypInf typ2) -> writeTypInf mystr1 typ2
-        (MTypInf typ1, MVar _ _) -> writeTypInf mystr2 typ1
+        (MVar _, MVar _) -> mergeUfr const mystr1 mystr2
+        (MVar _, MTypInf typ2) -> writeTypInf mystr1 typ2
+        (MTypInf typ1, MVar _) -> writeTypInf mystr2 typ1
         (MTypInf typ1, MTypInf typ2) -> unify typ1 typ2
 
 generalize typGen = do
-  boundVars <- envBoundVars
+  boundVars <- boundInEnv
   let gen = \ case
         TIPrim -> pure TIPrim
         TIFun typX typY -> TIFun <$> gen typX <*> gen typY
-        TISum typs -> TISum <$> traverse gen typs
-        TIProd typs -> TIProd <$> traverse gen typs
+        TISum (nmsReq, nmsqPos, typs) ->
+          TISum . (,,) nmsReq nmsqPos <$> traverse gen typs
+        TIProd (nmsReq, nmsqPos, typs) ->
+          TIProd . (,,) nmsReq nmsqPos <$> traverse gen typs
         TIMyst mystr -> readUfr mystr >>= \ case
-                         MVar var _ -> pure $ if S.member var boundVars
-                                              then TIMyst mystr
-                                              else TIVar var KITmp
-                         MTypInf typ -> gen typ
+                          MVar var -> pure $ if S.member var boundVars
+                                             then TIMyst mystr
+                                             else TIVar var
+                          MTypInf typ -> gen typ
   typ <- gen typGen
   -- TODO: stop continuing not being less evil....
-  typOfTypInf typ >>= (\typDebug -> debug "generalized" typDebug `seq` pure typ)
+  purify typ >>= (\typDebug -> debug "generalized" typDebug `seq` pure typ)
   where
-    envBoundVars :: ReaderT (Env (TypInf s)) (StateT [Var] (ST s)) (S.Set Var)
-    envBoundVars =
-      getEnv >>= foldlM (\vars typ -> S.union vars <$> typBoundVars typ) S.empty
-    typBoundVars = \ case
+    boundInEnv =
+      getEnv >>= foldlM (\vars typ -> S.union vars <$> boundInTyp typ) S.empty
+    boundInTyp = \ case
       TIPrim -> pure S.empty
-      TIVar _ _ -> pure S.empty
-      TIFun typX typY -> S.union <$> typBoundVars typX <*> typBoundVars typY
-      TISum typs -> foldl S.union S.empty <$> traverse typBoundVars typs
-      TIProd typs -> foldl S.union S.empty <$> traverse typBoundVars typs
+      TIVar _ -> pure S.empty
+      TIFun typX typY -> S.union <$> boundInTyp typX <*> boundInTyp typY
+      TISum (_, _, typs) -> foldl S.union S.empty <$> traverse boundInTyp typs
+      TIProd (_, _, typs) -> foldl S.union S.empty <$> traverse boundInTyp typs
       TIMyst mystr -> readUfr mystr >>= \ case
-                       MVar var _ -> pure $ S.singleton var
-                       MTypInf typ -> typBoundVars typ
+                        MVar var -> pure $ S.singleton var
+                        MTypInf typ -> boundInTyp typ
 
 specialize = flip evalStateT M.empty . spc
   where
-    spc :: TypInf s -> StateT (Env (TypInf s)) (ReaderT (Env (TypInf s)) (StateT [Var] (ST s))) (TypInf s)
     spc = \ case
       TIPrim -> pure TIPrim
-      TIVar var _ -> M.lookup var <$> get >>= \ case
-                    Nothing -> do
-                      -- Lift from the StateT [Var].
-                      typ <- lift unknown
-                      modify $ M.insert var typ
-                      pure typ
-                    Just typ -> pure typ
+      TIVar var -> M.lookup var <$> get >>= \ case
+                     Nothing -> do
+                       -- Lift from the StateT [Var].
+                       typ <- lift unknown
+                       modify $ M.insert var typ
+                       pure typ
+                     Just typ -> pure typ
       TIFun typX typY -> TIFun <$> spc typX <*> spc typY
-      TISum typs -> TISum <$> traverse spc typs
-      TIProd typs -> TIProd <$> traverse spc typs
+      -- TISum typs -> TISum <$> traverse spc typs
+      -- TIProd typs -> TIProd <$> traverse spc typs
       TIMyst mystr -> readUfr mystr >>= \ case
-                       MVar var _ -> pure $ TIMyst mystr
-                       MTypInf typ -> spc typ
+                        MVar var -> pure $ TIMyst mystr
+                        MTypInf typ -> spc typ
 
 writeTypInf mystr typ = do
   infinite <- appearsIn typ
@@ -312,27 +308,27 @@ writeTypInf mystr typ = do
     appearsIn = \ case
       TIPrim -> pure False
       TIFun typX typY -> (||) <$> appearsIn typX <*> appearsIn typY
-      TISum typs -> any id <$> traverse appearsIn typs
-      TIProd typs -> any id <$> traverse appearsIn typs
+      -- TISum typs -> any id <$> traverse appearsIn typs
+      -- TIProd typs -> any id <$> traverse appearsIn typs
       TIMyst mystrOther -> readUfr mystrOther >>= \ case
-                            MVar var _ -> equalUfr mystr mystrOther
-                            MTypInf typ -> appearsIn typ
+                             MVar var -> equalUfr mystr mystrOther
+                             MTypInf typ -> appearsIn typ
 
-typOfTypInf = \ case
+purify = \ case
   TIPrim -> pure TPrim
-  TIVar var _ -> pure $ TVar var KTmp
-  TIFun typX typY -> TFun <$> typOfTypInf typX <*> typOfTypInf typY
-  TISum typs -> TSum <$> traverse typOfTypInf typs
-  TIProd typs -> TProd <$> traverse typOfTypInf typs
+  TIVar var -> pure $ TVar var
+  TIFun typX typY -> TFun <$> purify typX <*> purify typY
+  -- TISum typs -> TSum <$> traverse purify typs
+  -- TIProd typs -> TProd <$> traverse purify typs
   TIMyst mystr -> readUfr mystr >>= \ case
-                   MVar var _ -> pure $ TVar ('_':var) KTmp
-                   MTypInf typ -> typOfTypInf typ
+                    MVar var -> pure $ TVar ('_':var)
+                    MTypInf typ -> purify typ
 
 vars = map (('t':) . show) [0..]
 
 -- Eta-expansion enables inference of higher rank type needed for runST.
-runInfer exp = runST $
-  (>>= typOfTypInf)
+runTypInfer exp = runST $
+  (>>= purify)
   . flip evalStateT vars
   . flip runReaderT M.empty
   $ infer exp
